@@ -10,9 +10,10 @@ import integrations as integ
 from integrations import IntegrationError
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE, "plataformavenda.db")
+DB_PATH = os.environ.get("PV_DB_PATH") or os.path.join(BASE, "plataformavenda.db")
 STATIC = os.path.join(BASE, "static")
 PORT = int(os.environ.get("PORT", "8000"))
+APP_VERSION = "1.2.0"
 
 # ---------------------------------------------------------------- DB
 def db():
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS companies(id INTEGER PRIMARY KEY AUTOINCREMENT, name 
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, name TEXT, email TEXT UNIQUE, pass_hash TEXT, salt TEXT,
   role TEXT DEFAULT 'owner', is_platform_admin INTEGER DEFAULT 0, created_at TEXT);
 CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, token_hash TEXT, created_at TEXT, expires_at TEXT);
+CREATE TABLE IF NOT EXISTS password_resets(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, token_hash TEXT, expires_at TEXT, used INTEGER DEFAULT 0, created_at TEXT);
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, name TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, category_id INTEGER, name TEXT, description TEXT DEFAULT '',
   price REAL DEFAULT 0, cost REAL DEFAULT 0, stock INTEGER DEFAULT 0, audience TEXT DEFAULT '', icon TEXT DEFAULT '🎁', status TEXT DEFAULT 'ativo',
@@ -393,11 +395,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -406,6 +415,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -481,6 +491,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache" if ext == ".html" else "public, max-age=3600")
+        self._security_headers()
         self.end_headers()
         self.wfile.write(data)
 
@@ -517,6 +529,41 @@ class Handler(BaseHTTPRequestHandler):
             if not company:
                 return self.send_json({"error": "Loja não encontrada"}, 404)
             return self.public_checkout(conn, company, data)
+        m = re.match(r"^/api/public/store/([\w-]+)/cart$", path)
+        if m and method == "POST":
+            company = conn.execute("SELECT * FROM companies WHERE slug=?", (m.group(1),)).fetchone()
+            if not company:
+                return self.send_json({"error": "Loja não encontrada"}, 404)
+            items = data.get("items") or []
+            if not items:
+                return self.send_json({"error": "Carrinho vazio."}, 400)
+            if not (data.get("phone") or "").strip():
+                return self.send_json({"error": "Informe seu WhatsApp para salvar o carrinho e receber o lembrete (só sobre este pedido)."}, 400)
+            total, labels = 0.0, []
+            for it in items:
+                p = conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND status='ativo'", (it.get("product_id"), company["id"])).fetchone()
+                if not p:
+                    continue
+                qty = max(int(it.get("qty") or 1), 1)
+                total += float(p["price"]) * qty
+                labels.append(f"{p['name']} x{qty}")
+            cur = conn.execute("INSERT INTO carts(company_id,customer_name,phone,items,total,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                               (company["id"], data.get("customer_name") or "Cliente da loja", data.get("phone", ""), ", ".join(labels), round(total, 2), "abandonado", 0, now(), now()))
+            return self.send_json({"ok": True, "cart_id": cur.lastrowid, "total": round(total, 2), "message": "Carrinho salvo! 💾 Se você não concluir, a loja poderá te lembrar pelo WhatsApp (somente sobre este pedido)."}, 201)
+        m = re.match(r"^/api/public/store/([\w-]+)/review$", path)
+        if m and method == "POST":
+            company = conn.execute("SELECT * FROM companies WHERE slug=?", (m.group(1),)).fetchone()
+            if not company:
+                return self.send_json({"error": "Loja não encontrada"}, 404)
+            rating = max(1, min(5, int(data.get("rating") or 5)))
+            if not (data.get("customer_name") or "").strip() or not (data.get("comment") or "").strip():
+                return self.send_json({"error": "Informe seu nome e um comentário para avaliar."}, 400)
+            product = conn.execute("SELECT * FROM products WHERE id=? AND company_id=?", (data.get("product_id"), company["id"])).fetchone()
+            if not product:
+                return self.send_json({"error": "Produto não encontrado"}, 404)
+            cur = conn.execute("INSERT INTO reviews(company_id,product_id,customer_name,rating,comment,created_at) VALUES(?,?,?,?,?,?)",
+                               (company["id"], product["id"], data["customer_name"].strip()[:80], rating, data["comment"].strip()[:500], now()))
+            return self.send_json({"ok": True, "review_id": cur.lastrowid, "message": "Obrigado pela avaliação! ⭐ Ela já aparece na loja."}, 201)
 
         # ---------------- Webhooks publicos (Meta / Mercado Pago) ----------------
         if path == "/api/webhooks/whatsapp" and method == "GET":
@@ -531,7 +578,8 @@ class Handler(BaseHTTPRequestHandler):
                         cfg = json.loads(r["config"] or "{}")
                     except Exception:
                         cfg = {}
-                    if cfg.get("verify_token") and cfg["verify_token"] == token:
+                    saved_verify = integ.decrypt_field("whatsapp", "verify_token", cfg.get("verify_token") or "")
+                    if saved_verify and saved_verify == token:
                         return self.send_text(challenge, 200)
             return self.send_text("Forbidden", 403)
         if path == "/api/webhooks/whatsapp" and method == "POST":
@@ -545,16 +593,69 @@ class Handler(BaseHTTPRequestHandler):
                 pid = str(((data.get("data") or {}).get("id")) or data.get("id") or "")
             return self.webhook_mercadopago(conn, pid)
 
+        # Health publico (monitoramento/deploy)
+        if path == "/api/health" and method == "GET":
+            try:
+                conn.execute("SELECT 1")
+                db_ok = True
+            except Exception:
+                db_ok = False
+            return self.send_json({"status": "ok" if db_ok else "degraded", "app": "ProdutoVenda IA", "version": APP_VERSION, "db": "ok" if db_ok else "erro", "time": now()})
+
         # Auth
         if path == "/api/auth/register" and method == "POST":
             return self.register(conn, data)
         if path == "/api/auth/login" and method == "POST":
             return self.login(conn, data)
+        if path == "/api/auth/forgot" and method == "POST":
+            email = (data.get("email") or "").strip().lower()
+            user_row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+            generic = {"ok": True, "message": "Se existir uma conta com este e-mail, enviamos um link de redefinição (válido por 1 hora). Verifique também a caixa de spam."}
+            if not user_row:
+                return self.send_json(generic)
+            token = secrets.token_urlsafe(40)
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            expires = (datetime.datetime.now() + datetime.timedelta(hours=1)).isoformat(timespec="seconds")
+            conn.execute("INSERT INTO password_resets(user_id,token_hash,expires_at,used,created_at) VALUES(?,?,?,?,?)", (user_row["id"], token_hash, expires, 0, now()))
+            link = f"{self.base_url()}/?reset_token={token}#/login"
+            smtp_cfg = integ.get_config(conn, user_row["company_id"], "smtp", active_only=True)
+            if integ.configured_status("smtp", smtp_cfg)[0]:
+                try:
+                    integ.smtp_send(smtp_cfg, email, "Redefinir sua senha — ProdutoVenda IA",
+                                    f"Olá!\n\nRecebemos um pedido para redefinir a senha da sua conta.\nUse este link (válido por 1 hora):\n{link}\n\nSe não foi você, ignore este e-mail.")
+                    log_audit(conn, user_row["company_id"], user_row["id"], "password_reset_sent", email)
+                    return self.send_json(generic)
+                except IntegrationError as e:
+                    return self.send_json({"error": f"Não foi possível enviar o e-mail de redefinição: {e}"}, 502)
+            log_audit(conn, user_row["company_id"], user_row["id"], "password_reset_created", email)
+            if os.environ.get("PV_ALLOW_RESET_LINK") == "1":
+                return self.send_json({**generic, "reset_link": link, "message": generic["message"] + " (Modo local: link exibido porque o SMTP não está configurado.)"})
+            return self.send_json({**generic, "message": generic["message"] + " Dica: configure o SMTP em Integrações para o envio automático do link."})
+        if path == "/api/auth/reset" and method == "POST":
+            token = data.get("token") or ""
+            password = data.get("password") or ""
+            if len(password) < 6:
+                return self.send_json({"error": "A nova senha precisa de pelo menos 6 caracteres."}, 400)
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            row = conn.execute("SELECT * FROM password_resets WHERE token_hash=? AND used=0 AND expires_at>?", (token_hash, now())).fetchone()
+            if not row:
+                return self.send_json({"error": "Link inválido ou expirado. Solicite uma nova redefinição."}, 400)
+            ph, salt = hash_pass(password)
+            conn.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?", (ph, salt, row["user_id"]))
+            conn.execute("UPDATE password_resets SET used=1 WHERE id=?", (row["id"],))
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (row["user_id"],))
+            return self.send_json({"ok": True, "message": "Senha redefinida! Faça login com a nova senha."})
 
         user, company = self.require_auth(conn)
         if not user:
             return
         cid = user["company_id"]
+
+        if path == "/api/auth/logout" and method == "POST":
+            header = self.headers.get("Authorization") or ""
+            if header.startswith("Bearer "):
+                conn.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(header[7:].encode()).hexdigest(),))
+            return self.send_json({"ok": True, "message": "Sessão encerrada."})
 
         if path == "/api/auth/me" and method == "GET":
             plan = conn.execute("SELECT * FROM plans WHERE id=?", (company["plan_id"],)).fetchone()
@@ -663,6 +764,28 @@ class Handler(BaseHTTPRequestHandler):
             if sent == 0 and errors:
                 return self.send_json({"error": f"Nenhum e-mail enviado: {errors[0]}"}, 502)
             return self.send_json({"ok": True, "sent": sent, "message": f"✉️ {sent} e-mail(s) enviados via SMTP para clientes que autorizaram contato." + (f" {len(errors)} falha(s)." if errors else "")})
+        if path == "/api/admin/export" and method == "GET":
+            tables = ["products", "customers", "leads", "opportunities", "orders", "order_items", "coupons", "campaigns", "campaign_contents",
+                      "automations", "proposals", "reviews", "payments", "email_campaigns", "carts", "messages"]
+            export = {"app": "ProdutoVenda IA", "version": APP_VERSION, "exported_at": now(), "company": dict(company), "data": {}}
+            for t in tables:
+                try:
+                    export["data"][t] = [dict(r) for r in conn.execute(f"SELECT * FROM {t} WHERE company_id=? ORDER BY id", (cid,))]
+                except Exception:
+                    export["data"][t] = []
+            integ_summary = [{"provider": i["provider"], "name": i["name"], "status": i["status"]} for i in integ.list_integrations(conn, cid)]
+            export["integrations"] = integ_summary
+            log_audit(conn, cid, user["id"], "data_export", f"{sum(len(v) for v in export['data'].values())} registros")
+            return self.send_json(export)
+        m = re.match(r"^/api/customers/(\d+)/timeline$", path)
+        if m and method == "GET":
+            cust = conn.execute("SELECT * FROM customers WHERE id=? AND company_id=?", (m.group(1), cid)).fetchone()
+            if not cust:
+                return self.send_json({"error": "Cliente não encontrado"}, 404)
+            orders = [dict(r) for r in conn.execute("SELECT * FROM orders WHERE company_id=? AND (customer_id=? OR customer_name=?) ORDER BY id DESC LIMIT 30", (cid, cust["id"], cust["name"]))]
+            msgs = [dict(r) for r in conn.execute("SELECT * FROM messages WHERE company_id=? AND customer_id=? ORDER BY id DESC LIMIT 30", (cid, cust["id"]))]
+            leads = [dict(r) for r in conn.execute("SELECT * FROM leads WHERE company_id=? AND (email=? AND email!='' OR name=?) ORDER BY id DESC LIMIT 10", (cid, cust["email"], cust["name"]))]
+            return self.send_json({"customer": dict(cust), "orders": orders, "messages": msgs, "leads": leads})
         if path == "/api/messages" and method == "GET":
             rows = [dict(r) for r in conn.execute("SELECT m.*, c.name customer_name FROM messages m LEFT JOIN customers c ON c.id=m.customer_id WHERE m.company_id=? ORDER BY m.id DESC LIMIT 60", (cid,))]
             return self.send_json({"messages": rows})
@@ -840,7 +963,7 @@ class Handler(BaseHTTPRequestHandler):
             audit = [dict(r) for r in conn.execute("SELECT * FROM audit_logs WHERE company_id=? ORDER BY id DESC LIMIT 15", (cid,))]
             counts = {t: conn.execute(f"SELECT COUNT(*) c FROM {t} WHERE company_id=?", (cid,)).fetchone()["c"] for t in ["products", "customers", "leads", "campaigns", "orders"]}
             integ_items = integ.list_integrations(conn, cid)
-            return self.send_json({"plans": plans, "users": users, "usage": dict(usage), "audit": audit, "counts": counts,
+            return self.send_json({"plans": plans, "users": users, "usage": dict(usage), "audit": audit, "counts": counts, "version": APP_VERSION,
                                    "integrations": [{"name": i["name"], "status": i["status"], "desc": i["desc"]} for i in integ_items]})
         if path == "/api/admin/plan" and method == "POST":
             conn.execute("UPDATE companies SET plan_id=? WHERE id=?", (int(data.get("plan_id")), cid))
@@ -1150,6 +1273,8 @@ class Handler(BaseHTTPRequestHandler):
                 payment_info = {"id": cur.lastrowid, "method": payment_method, "status": result["status"], "qr_code": qr, "qr_code_base64": qrb64, "checkout_url": result.get("checkout_url", "")}
             except IntegrationError as e:
                 payment_info = {"method": payment_method, "status": "erro", "error": f"{e} {integ.provider_error_detail(e.detail)}".strip()}
+        if data.get("phone"):
+            conn.execute("UPDATE carts SET status='recuperado', updated_at=? WHERE company_id=? AND phone=? AND status='abandonado'", (now(), cid, data["phone"]))
         conn.commit()
         if use_gateway and payment_info and payment_info.get("status") != "erro":
             msg = "Pedido criado! ✅ Conclua o pagamento Pix para confirmar." if payment_method == "pix" else "Pedido criado! ✅ Conclua o pagamento no link do Mercado Pago para confirmar."
@@ -1249,11 +1374,41 @@ class Handler(BaseHTTPRequestHandler):
         cid = company["id"]
         runs = []
         carts = conn.execute("SELECT * FROM carts WHERE company_id=? AND status='abandonado'", (cid,)).fetchall()
+        wa_cfg = integ.get_config(conn, cid, "whatsapp", active_only=True)
+        wa_ready = integ.configured_status("whatsapp", wa_cfg)[0]
         for cart in carts:
-            msg = "Oi! Seu pedido ainda está esperando por você 🍫 Quer que eu finalize para você?" if cart["stage"] == 0 else "Passando para lembrar do seu pedido 💛 Posso aplicar um cupom especial se você fechar hoje."
-            conn.execute("INSERT INTO messages(company_id,channel,content,status,created_at) VALUES(?,?,?,?,?)", (cid, "WhatsApp", f"[{cart['customer_name']}] {msg}", "registrado — recuperação de carrinho (envio via integração oficial quando conectada)", now()))
+            first = (cart["customer_name"] or "você").split(" ")[0]
+            msg = (f"Oi, {first}! Seu pedido na {company['name']} ainda está esperando por você 🛒 ({cart['items'] or 'seus itens'} — {brl(cart['total'])}). Quer que eu finalize para você?"
+                   if cart["stage"] == 0 else
+                   f"Oi, {first}! Passando para lembrar do seu pedido na {company['name']} 💛 Se fechar hoje, consigo te ajudar com um cupom especial. Posso finalizar?")
+            # cliente vinculado (consentimento) por telefone/nome
+            cust = None
+            for cand in conn.execute("SELECT * FROM customers WHERE company_id=?", (cid,)).fetchall():
+                cd_ = re.sub(r"\D", "", cand["phone"] or "")
+                ct_ = re.sub(r"\D", "", cart["phone"] or "")
+                if (ct_ and cd_ and cd_.endswith(ct_[-11:])) or cand["name"] == cart["customer_name"]:
+                    cust = cand
+                    break
+            status_log, sent_real = "na fila — WhatsApp Cloud API não configurada", False
+            if wa_ready and cart["phone"] and (cust is None or cust["consent"]):
+                try:
+                    wamid, _ = integ.whatsapp_send(wa_cfg, cart["phone"], msg)
+                    status_log, sent_real = "enviado via WhatsApp Cloud API", True
+                    conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,external_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                                 (cid, cust["id"] if cust else None, "WhatsApp", msg, status_log, wamid, now()))
+                except IntegrationError as e:
+                    status_log = f"falha no envio WhatsApp: {e} {integ.provider_error_detail(e.detail)}"[:240]
+                    conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
+                                 (cid, cust["id"] if cust else None, "WhatsApp", msg, status_log, now()))
+            elif cust is not None and not cust["consent"]:
+                status_log = "bloqueado — cliente sem consentimento (LGPD)"
+                conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
+                             (cid, cust["id"], "WhatsApp", msg, status_log, now()))
+            else:
+                conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
+                             (cid, cust["id"] if cust else None, "WhatsApp", msg, status_log, now()))
             conn.execute("UPDATE carts SET stage=stage+1, updated_at=? WHERE id=?", (now(), cart["id"]))
-            runs.append(f"Recuperação de carrinho: mensagem registrada para {cart['customer_name']} ({brl(cart['total'])})")
+            runs.append(f"Recuperação de carrinho: {'✅ enviado via WhatsApp' if sent_real else status_log} para {cart['customer_name']} ({brl(cart['total'])})")
         inactive = conn.execute("SELECT * FROM customers WHERE company_id=? AND (last_purchase IS NULL OR last_purchase < date('now','-60 day'))", (cid,)).fetchall()
         for cust in inactive:
             exists = conn.execute("SELECT id FROM opportunities WHERE company_id=? AND name=? AND status='Nova'", (cid, cust["name"])).fetchone()

@@ -20,6 +20,22 @@ python3 server.py
 # abre http://localhost:8000
 ```
 
+### 🐳 Com Docker (produção)
+
+```bash
+cp .env.example .env   # defina PV_MASTER_KEY forte
+docker compose up -d --build
+# http://localhost:8000/api/health -> {"status":"ok", ...}
+```
+
+### 🧪 Testes automatizados
+
+```bash
+python3 -m unittest discover -s tests -v   # 6 smoke tests com servidor+banco temporários
+```
+
+Cobrem: health, login/dashboard, isolamento multi-tenant, loja pública (carrinho salvo → checkout com cupom → avaliação), integrações (segredo mascarado **e criptografado em repouso**), webhook do WhatsApp, recuperação de senha completa e exportação sem segredos.
+
 ### 🔑 Conta de demonstração (caso de uso inicial: Chocolates 🍫)
 
 | Campo | Valor |
@@ -74,6 +90,9 @@ plataformavenda.db SQLite (criado automaticamente; ignorado no Git)
 ## 🔐 Segurança & LGPD
 
 - Senhas com **PBKDF2-HMAC-SHA256** (200k iterações + salt), sessões com token hasheado e expiração, **rate limiting** no login, queries parametrizadas, validação de entrada, logs de auditoria.
+- **Credenciais das integrações criptografadas em repouso** (ChaCha20 + HMAC-SHA256, chave-mestra fora do banco via `PV_MASTER_KEY` ou `.pv_master_key` 0600, com migração transparente de valores antigos) e sempre mascaradas na API.
+- **Recuperação de senha** com token de uso único (1h, hasheado) enviado por SMTP quando configurado; logout invalida a sessão no servidor.
+- Headers de segurança (`nosniff`, `X-Frame-Options`, `Referrer-Policy`…), `/api/health` para monitoramento e **exportação de dados** da empresa em JSON (sem senhas/segredos) em Admin.
 - **Nada de spam/scraping**: mensagens comerciais só para clientes com consentimento registrado (o servidor bloqueia o envio sem opt-in), prospecção desenhada para APIs autorizadas (ex.: Google Places), opt-out respeitado. Enquanto integrações oficiais (WhatsApp Cloud API, Meta, gateway de pagamento, e-mail) não estão conectadas, envios/publicações ficam **registrados em fila — nunca simulados como feitos**.
 
 ## 🧪 Testes rápidos da API

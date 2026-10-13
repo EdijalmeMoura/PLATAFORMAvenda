@@ -12,7 +12,7 @@ por tenant (company_id) no banco do servidor e NUNCA sao devolvidas inteiras
 pela API (sempre mascaradas). Nada e simulado: sem credencial valida, a chamada
 real nao acontece e o erro e explicado.
 """
-import json, re, smtplib, ssl, urllib.request, urllib.error, urllib.parse
+import json, os, re, base64, hashlib, hmac, smtplib, ssl, struct, urllib.request, urllib.error, urllib.parse
 from email.message import EmailMessage
 
 GRAPH = "https://graph.facebook.com"
@@ -25,6 +25,99 @@ class IntegrationError(Exception):
         super().__init__(message)
         self.status = status
         self.detail = detail
+
+
+# ------------------------------------------------------------------
+# Criptografia das credenciais em repouso (ChaCha20 + HMAC-SHA256,
+# encrypt-then-MAC). A chave-mestra fica FORA do banco: variavel de
+# ambiente PV_MASTER_KEY ou arquivo .pv_master_key (0600) ao lado do
+# banco. Valores antigos em texto puro continuam legiveis (migracao
+# transparente: sao regravados criptografados no proximo save).
+# ------------------------------------------------------------------
+_KEY_CACHE = None
+
+
+def _master_key():
+    global _KEY_CACHE
+    if _KEY_CACHE:
+        return _KEY_CACHE
+    env = os.environ.get("PV_MASTER_KEY", "")
+    if env:
+        _KEY_CACHE = hashlib.sha256(env.encode()).digest()
+        return _KEY_CACHE
+    key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pv_master_key")
+    try:
+        if os.path.exists(key_file):
+            raw = open(key_file).read().strip()
+        else:
+            import secrets as _secrets
+            raw = _secrets.token_hex(32)
+            fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.write(fd, raw.encode())
+            os.close(fd)
+        _KEY_CACHE = hashlib.sha256(raw.encode()).digest()
+    except Exception:
+        _KEY_CACHE = hashlib.sha256(b"pv-fallback-key-change-me").digest()
+    return _KEY_CACHE
+
+
+def _rotl(v, c):
+    return ((v << c) & 0xFFFFFFFF) | (v >> (32 - c))
+
+
+def _quarter(x, a, b, c, d):
+    x[a] = (x[a] + x[b]) & 0xFFFFFFFF; x[d] = _rotl(x[d] ^ x[a], 16)
+    x[c] = (x[c] + x[d]) & 0xFFFFFFFF; x[b] = _rotl(x[b] ^ x[c], 12)
+    x[a] = (x[a] + x[b]) & 0xFFFFFFFF; x[d] = _rotl(x[d] ^ x[a], 8)
+    x[c] = (x[c] + x[d]) & 0xFFFFFFFF; x[b] = _rotl(x[b] ^ x[c], 7)
+
+
+def _chacha20(key, nonce, data, counter=1):
+    consts = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]
+    kw = list(struct.unpack("<8I", key))
+    nw = list(struct.unpack("<3I", nonce))
+    out = bytearray()
+    block_counter = counter
+    for offset in range(0, len(data), 64):
+        state = consts + kw + [block_counter] + nw
+        x = list(state)
+        for _ in range(10):
+            _quarter(x, 0, 4, 8, 12); _quarter(x, 1, 5, 9, 13); _quarter(x, 2, 6, 10, 14); _quarter(x, 3, 7, 11, 15)
+            _quarter(x, 0, 5, 10, 15); _quarter(x, 1, 6, 11, 12); _quarter(x, 2, 7, 8, 13); _quarter(x, 3, 4, 9, 14)
+        block = struct.pack("<16I", *[((x[i] + state[i]) & 0xFFFFFFFF) for i in range(16)])
+        chunk = data[offset:offset + 64]
+        out.extend(bytes(a ^ b for a, b in zip(chunk, block)))
+        block_counter += 1
+    return bytes(out)
+
+
+def encrypt_secret(plaintext):
+    if plaintext is None or str(plaintext) == "":
+        return plaintext
+    key = _master_key()
+    nonce = os.urandom(12)
+    ct = _chacha20(key, nonce, str(plaintext).encode())
+    tag = hmac.new(key, nonce + ct, hashlib.sha256).digest()[:16]
+    return "enc:v1:" + base64.urlsafe_b64encode(nonce + tag + ct).decode()
+
+
+def decrypt_secret(value):
+    if not value or not str(value).startswith("enc:v1:"):
+        return value  # legado em texto puro
+    try:
+        raw = base64.urlsafe_b64decode(str(value)[7:].encode())
+        nonce, tag, ct = raw[:12], raw[12:28], raw[28:]
+        key = _master_key()
+        expected = hmac.new(key, nonce + ct, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(tag, expected):
+            return ""
+        return _chacha20(key, nonce, ct).decode()
+    except Exception:
+        return ""
+
+
+def decrypt_field(provider, field_name, value):
+    return decrypt_secret(value) if is_secret(provider, field_name) else value
 
 
 PROVIDERS = {
@@ -113,9 +206,10 @@ def get_config(conn, company_id, provider, active_only=False):
     if active_only and not row["active"]:
         return {}
     try:
-        return json.loads(row["config"] or "{}")
+        cfg = json.loads(row["config"] or "{}")
     except Exception:
         return {}
+    return {k: decrypt_field(provider, k, v) for k, v in cfg.items()}
 
 
 def integration_row(conn, company_id, provider):
@@ -158,12 +252,7 @@ def list_integrations(conn, company_id):
     out = []
     for provider in PROVIDERS:
         row = integration_row(conn, company_id, provider)
-        config = {}
-        if row:
-            try:
-                config = json.loads(row["config"] or "{}")
-            except Exception:
-                config = {}
+        config = get_config(conn, company_id, provider) if row else {}
         out.append(public_config(provider, config, row))
     return out
 
@@ -189,12 +278,13 @@ def save_config(conn, company_id, provider, incoming):
     existing = integration_row(conn, company_id, provider)
     import datetime as _dt
     ts = _dt.datetime.now().isoformat(timespec="seconds")
+    stored = {k: (encrypt_secret(v) if is_secret(provider, k) and v else v) for k, v in merged.items()}
     if existing:
         conn.execute("UPDATE integrations SET config=?, active=?, updated_at=? WHERE company_id=? AND provider=?",
-                     (json.dumps(merged, ensure_ascii=False), active, ts, company_id, provider))
+                     (json.dumps(stored, ensure_ascii=False), active, ts, company_id, provider))
     else:
         conn.execute("INSERT INTO integrations(company_id,provider,config,active,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                     (company_id, provider, json.dumps(merged, ensure_ascii=False), active, ts, ts))
+                     (company_id, provider, json.dumps(stored, ensure_ascii=False), active, ts, ts))
     return merged
 
 

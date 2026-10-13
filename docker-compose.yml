@@ -1,0 +1,17 @@
+services:
+  produtovenda:
+    build: .
+    container_name: produtovenda-ia
+    ports:
+      - "8000:8000"
+    environment:
+      # TROQUE por uma chave forte e guarde fora do repositorio.
+      # Ela criptografa as credenciais das integracoes no banco.
+      PV_MASTER_KEY: "troque-por-uma-chave-forte-e-secreta"
+      PORT: "8000"
+    volumes:
+      - produtovenda-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  produtovenda-data:

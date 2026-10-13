@@ -57,6 +57,7 @@ function renderAuth(mode = "login") {
         <label class="f">Senha</label><input id="a-password" type="password" required placeholder="Mínimo 6 caracteres">
         <button class="btn block mt" type="submit">${mode === "login" ? "Entrar →" : "Criar conta e começar →"}</button>
       </form>
+      ${mode === "login" ? `<p class="small mt"><button class="link-btn" onclick="App.forgotPassword()">Esqueci minha senha</button></p>` : ""}
       <p class="small mt">${mode === "login" ? 'Ainda não tem conta? <button class="link-btn" onclick="App.authMode(\'register\')">Criar conta grátis</button>' : 'Já tem conta? <button class="link-btn" onclick="App.authMode(\'login\')">Entrar</button>'}</p>
       <div class="demo-box"><b>🔑 Conta de demonstração (Chocolates):</b><br>E-mail: <b>demo@produtovenda.com.br</b><br>Senha: <b>demo1234</b><br><button class="btn sm mt" onclick="App.demoLogin()">Entrar na demonstração →</button></div>
       <p class="small mut mt">🔒 Senhas com hash PBKDF2, sessões seguras, isolamento por empresa (multi-tenant) e respeito à LGPD: nada de spam — comunicação só com consentimento.</p>
@@ -73,6 +74,20 @@ function renderAuth(mode = "login") {
   };
 }
 function logout(reload = true) { state.token = ""; state.me = null; localStorage.removeItem("pv_token"); if (reload) renderAuth(); }
+function renderReset(token) {
+  $("#app").innerHTML = `<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:22px"><div class="auth-box">
+    <div style="font-size:34px">🔑</div><h2>Redefinir senha</h2><p class="sub">Escolha uma nova senha para sua conta (o link vale 1 hora e só pode ser usado uma vez).</p>
+    <form id="reset-form"><label class="f">Nova senha</label><input id="r-pass" type="password" required placeholder="Mínimo 6 caracteres">
+    <label class="f">Confirmar nova senha</label><input id="r-pass2" type="password" required>
+    <button class="btn block mt" type="submit">Salvar nova senha →</button></form>
+    <p class="small mt"><button class="link-btn" onclick="location.search='';location.hash='';location.reload()">Voltar ao login</button></p></div></div>`;
+  $("#reset-form").onsubmit = async (e) => {
+    e.preventDefault();
+    if ($("#r-pass").value !== $("#r-pass2").value) return toast("As senhas não conferem.", "err");
+    try { const r = await api("/api/auth/reset", "POST", { token, password: $("#r-pass").value }); toast(r.message, "ok"); history.replaceState({}, "", location.pathname); location.hash = ""; renderAuth(); }
+    catch (err) { toast(err.message, "err"); }
+  };
+}
 
 /* ================= SHELL ================= */
 const NAV = [
@@ -107,6 +122,8 @@ function shell(contentHtml, title) {
 }
 function storeUrl() { return location.origin + location.pathname + "#/loja/" + state.me.company.slug; }
 async function boot() {
+  const resetToken = new URLSearchParams(location.search).get("reset_token");
+  if (resetToken) return renderReset(resetToken);
   if (!state.token) return renderAuth();
   try { state.me = await api("/api/auth/me"); } catch { return renderAuth(); }
   if (!state.me.company.onboarded) return renderOnboarding();
@@ -282,9 +299,12 @@ async function renderPublicStore(slug) {
     ${page.faq ? `<details class="small mut"><summary style="cursor:pointer;font-weight:700">Perguntas frequentes</summary>${page.faq.map(f => `<p><b>${esc(f.q)}</b><br>${esc(f.a)}</p>`).join("")}</details>` : ""}
     <button class="btn block mt" style="background:${color}" onclick="App.addCart(${p.id})">Adicionar ao carrinho 🛒</button></div></div>`; }).join("")}</div>
     ${data.reviews.length ? `<h3 class="mt">⭐ O que dizem nossos clientes</h3><div class="grid g3">${data.reviews.map(r => `<div class="card"><b>${"⭐".repeat(r.rating || 5)}</b><p class="small">"${esc(r.comment)}"</p><p class="small mut">— ${esc(r.customer_name)}</p></div>`).join("")}</div>` : ""}
+    <div class="card mt"><h3>⭐ Avalie sua compra</h3><div class="grid g3"><div><label class="f">Produto</label><select id="rv-product">${data.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select></div><div><label class="f">Seu nome</label><input id="rv-name" placeholder="Ex.: Maria S."></div><div><label class="f">Nota</label><select id="rv-rating">${[5, 4, 3, 2, 1].map(n => `<option value="${n}">${"⭐".repeat(n)}</option>`).join("")}</select></div></div>
+    <label class="f">Comentário</label><textarea id="rv-comment" placeholder="Conte como foi sua experiência…"></textarea><button class="btn mt" style="background:${color}" onclick="App.submitReview()">Enviar avaliação</button></div>
     <div class="card mt" id="cart-section"><h3>🛒 Seu carrinho</h3>
     ${state.cart.length ? state.cart.map((c, i) => `<div class="row between" style="padding:7px 0;border-bottom:1px solid var(--line)"><span>${esc(c.icon || "")} ${esc(c.name)}</span><span class="row"><button class="icon-btn" onclick="App.cartQty(${i},-1)">−</button><b>${c.qty}</b><button class="icon-btn" onclick="App.cartQty(${i},1)">+</button><b>${money(c.price * c.qty)}</b><button class="icon-btn" onclick="App.cartRemove(${i})">🗑️</button></span></div>`).join("") + `<p class="row between mt"><span>Total</span><b style="font-size:19px">${money(cartTotal)}</b></p>
     <form id="checkout-form"><div class="grid g3"><div><label class="f">Seu nome</label><input id="co-name" required></div><div><label class="f">WhatsApp</label><input id="co-phone"></div><div><label class="f">E-mail</label><input id="co-email" type="email"></div></div>
+    <div class="row mt"><button class="btn ghost sm" type="button" onclick="App.savePublicCart()">💾 Salvar carrinho e receber lembrete no WhatsApp</button><span class="small mut">Sem compromisso — só sobre este pedido.</span></div>
     <label class="f">Cupom de desconto</label><input id="co-coupon" placeholder="Ex.: BEMVINDO10">
     <label class="f">Pagamento</label><select id="co-pay">${data.payments && data.payments.pix ? `<option value="pix">📱 Pix — Mercado Pago (QR Code na hora)</option><option value="card">💳 Cartão — Mercado Pago (link seguro)</option>` : ""}<option value="manual">💬 Combinar pagamento com a loja (WhatsApp/dinheiro)</option></select>${data.payments && data.payments.mercadopago ? `<p class="small mut">🔒 Pagamentos processados pelo Mercado Pago. Pedidos Pix/cartão são confirmados automaticamente quando o pagamento é aprovado.</p>` : ""}
     <button class="btn block mt" style="background:${color}" type="submit">Finalizar pedido · ${money(cartTotal)} →</button><p class="small mut">Frete/entrega combinados pelo WhatsApp após o pedido. Sem spam: só falamos sobre o seu pedido.</p></form>`
@@ -319,9 +339,9 @@ async function viewPedidos() {
 async function viewClientes() {
   const { customers } = await api("/api/customers");
   shell(`<div class="row between mb"><p class="mut" style="margin:0">Base de clientes com VIP, indicações ("Indique e ganhe") e consentimento LGPD para comunicações.</p><button class="btn" onclick="App.customerForm()">+ Novo cliente</button></div>
-  <div class="card"><table><tr><th>Cliente</th><th>Contato</th><th>Cidade/Segmento</th><th>Compras</th><th>Total gasto</th><th>Última compra</th><th>VIP / Indicação</th><th>Consent.</th><th></th></tr>
+  <div class="card"><input placeholder="🔎 Buscar cliente por nome, telefone, e-mail ou cidade…" oninput="App.searchRows(this,'clientes-body')" style="margin-bottom:12px"><table><thead><tr><th>Cliente</th><th>Contato</th><th>Cidade/Segmento</th><th>Compras</th><th>Total gasto</th><th>Última compra</th><th>VIP / Indicação</th><th>Consent.</th><th></th></tr></thead><tbody id="clientes-body">
   ${customers.map(c => `<tr><td><b>${esc(c.name)}</b></td><td class="small">${esc(c.phone)}<br>${esc(c.email)}</td><td class="small">${esc(c.city)}<br>${esc(c.segment)}</td><td>${c.purchases || 0}</td><td><b>${money(c.total_spent)}</b></td><td class="small">${esc(c.last_purchase || "—")}</td><td>${c.vip ? badge("👑 VIP", "b-amber") : ""} <span class="small mut">${esc(c.referral_code || "")} · ${c.referrals || 0} ind.</span></td><td>${c.consent ? badge("✓ Autorizou", "b-green") : badge("✕ Sem consent.", "b-red")}</td>
-  <td><span class="row"><button class="btn sm soft" onclick="App.messageCustomer(${c.id},'${esc(c.name).replace(/'/g, "")}')">💬 Mensagem</button><button class="btn sm ghost" onclick="App.customerForm(${c.id})">Editar</button></span></td></tr>`).join("")}</table>
+  <td><span class="row"><button class="btn sm soft" onclick="App.messageCustomer(${c.id},'${esc(c.name).replace(/'/g, "")}')">💬 Mensagem</button><button class="btn sm ghost" onclick="App.customerTimeline(${c.id})">📜 Histórico</button><button class="btn sm ghost" onclick="App.customerForm(${c.id})">Editar</button></span></td></tr>`).join("")}</tbody></table>
   <p class="small mut mt">👑 <b>Clientes VIP:</b> critérios configuráveis (nº de compras, valor gasto, frequência, indicação, aniversário) com cupons e ofertas exclusivas. 🎁 <b>Indique e ganhe:</b> cada cliente tem um código — quando o indicado compra, ele ganha o benefício configurado.</p></div>`, "Clientes");
   state._customers = customers;
 }
@@ -498,7 +518,8 @@ async function viewAdmin() {
   const ig = await api("/api/integrations").catch(() => ({ integrations: [] }));
   state._integrations = ig.integrations || [];
   shell(`<div class="card mb"><h3>🛡️ Administração da plataforma</h3><p class="mut">Usuários, planos, assinaturas, uso de IA, integrações, logs e métricas. Cada empresa (tenant) só enxerga os próprios dados.</p>
-  <div class="row mt">${Object.entries(a.counts).map(([k, v]) => badge(k + ": " + v, "b-violet")).join("")} ${badge("Ações de IA no mês: " + a.usage.actions, "b-green")} ${badge("Tokens estimados: " + a.usage.tokens, "b-gray")}</div></div>
+  <div class="row mt">${Object.entries(a.counts).map(([k, v]) => badge(k + ": " + v, "b-violet")).join("")} ${badge("Ações de IA no mês: " + a.usage.actions, "b-green")} ${badge("Tokens estimados: " + a.usage.tokens, "b-gray")} ${badge("Sistema: v" + (a.version || "1.2.0") + " · /api/health", "b-green")}</div>
+  <div class="row mt"><button class="btn sm soft" onclick="App.exportData()">📦 Exportar dados da empresa (JSON)</button><span class="small mut">Backup portátil dos seus dados — nunca inclui senhas nem segredos de integração.</span></div></div>
   <div class="card mb"><h3>🔌 Integrações reais</h3><p class="mut">Conecte suas credenciais oficiais — elas ficam salvas <b>apenas no servidor da sua empresa</b>, sempre mascaradas na tela, e nada é simulado: o botão <b>Testar conexão</b> faz uma chamada real à API. Guia passo a passo no arquivo <b>INTEGRACOES.md</b> do projeto.</p>
   <div class="grid g2 mt">${state._integrations.map(it => `<div style="border:1px solid var(--line);border-radius:14px;padding:15px">
     <div class="row between"><b>${esc(it.icon)} ${esc(it.name)}</b>${it.connected ? badge("● Conectada e ativa", "b-green") : it.configured ? badge("Configurada (desativada)", "b-amber") : badge("Não configurada", "b-gray")}</div>
@@ -536,7 +557,59 @@ const App = {
   closeModal, copyText,
   authMode: (m) => renderAuth(m),
   demoLogin: async () => { const r = await api("/api/auth/login", "POST", { email: "demo@produtovenda.com.br", password: "demo1234" }); state.token = r.token; localStorage.setItem("pv_token", r.token); toast("Bem-vindo(a) à demonstração! 🍫", "ok"); boot(); },
-  logout: () => { logout(); toast("Até logo! 👋"); },
+  logout: async () => { try { if (state.token) await api("/api/auth/logout", "POST", {}); } catch {} logout(); toast("Até logo! Sessão encerrada no servidor. 👋"); },
+  forgotPassword() {
+    openModal(`<div class="row between"><h3 style="margin:0">🔑 Esqueci minha senha</h3><button class="icon-btn" onclick="App.closeModal()">✕</button></div>
+    <p class="mut">Informe seu e-mail. Se a conta existir, enviaremos um link de redefinição válido por 1 hora (via SMTP, quando configurado em Integrações).</p>
+    <form id="forgot-form"><label class="f">E-mail da conta</label><input id="fg-email" type="email" required placeholder="voce@empresa.com.br">
+    <button class="btn block mt" type="submit">Enviar link de redefinição</button></form><div id="forgot-result" class="mt"></div>`);
+    $("#forgot-form").onsubmit = async (e) => {
+      e.preventDefault();
+      try { const r = await api("/api/auth/forgot", "POST", { email: $("#fg-email").value });
+        $("#forgot-result").innerHTML = `<div class="card" style="background:var(--panel2)"><p class="small">${esc(r.message)}</p>${r.reset_link ? `<p class="small"><b>Link (modo local):</b><br><a href="${esc(r.reset_link)}">${esc(r.reset_link)}</a></p>` : ""}</div>`;
+      } catch (err) { toast(err.message, "err"); }
+    };
+  },
+  async exportData() {
+    try {
+      const data = await api("/api/admin/export");
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+      a.download = `produtovenda-export-${state.me.company.slug}-${new Date().toISOString().slice(0, 10)}.json`; a.click();
+      URL.revokeObjectURL(a.href); toast("Exportação baixada! 📦 (sem senhas nem segredos de integração)", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  },
+  searchRows(input, tbodyId) {
+    const q = (input.value || "").toLowerCase();
+    document.querySelectorAll(`#${tbodyId} tr`).forEach(tr => { tr.style.display = tr.innerText.toLowerCase().includes(q) ? "" : "none"; });
+  },
+  async customerTimeline(id) {
+    try {
+      const t = await api(`/api/customers/${id}/timeline`);
+      const c = t.customer;
+      openModal(`<div class="row between"><h3 style="margin:0">👤 ${esc(c.name)}</h3><button class="icon-btn" onclick="App.closeModal()">✕</button></div>
+      <p class="small mut">${esc(c.phone)} · ${esc(c.email)} · ${esc(c.city)} · ${esc(c.segment)} · Total gasto <b>${money(c.total_spent)}</b> em ${c.purchases || 0} compra(s) · Última: ${esc(c.last_purchase || "—")} ${c.vip ? "· 👑 VIP" : ""} · Código de indicação: ${esc(c.referral_code || "—")}</p>
+      <h4>🧾 Pedidos (${t.orders.length})</h4>${t.orders.map(o => `<div class="row between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span>#${o.id} · ${esc(o.channel)} · ${esc((o.created_at || "").slice(0, 10))}</span><span><b>${money(o.total)}</b> ${statusBadge(o.status)}</span></div>`).join("") || '<p class="small mut">Nenhum pedido vinculado.</p>'}
+      <h4>💬 Mensagens (${t.messages.length})</h4>${t.messages.map(m => `<div class="small" style="padding:6px 0;border-bottom:1px solid var(--line)">${m.direction === "in" ? "📥" : "📤"} ${esc(m.content)}<br><span class="mut">${esc(m.status)} · ${esc((m.created_at || "").slice(0, 16).replace("T", " "))}</span></div>`).join("") || '<p class="small mut">Nenhuma mensagem registrada.</p>'}
+      ${t.leads.length ? `<h4>🗂️ No CRM (${t.leads.length})</h4>${t.leads.map(l => `<div class="small" style="padding:5px 0">• ${esc(l.name)} — ${statusBadge(l.stage)} (${money(l.value)})</div>`).join("")}` : ""}`, true);
+    } catch (e) { toast(e.message, "err"); }
+  },
+  async savePublicCart() {
+    const phone = ($("#co-phone")?.value || "").trim();
+    if (!phone) return toast("Informe seu WhatsApp no formulário para salvar o carrinho 📱", "err");
+    try {
+      const slug = state.publicData.company.slug;
+      const r = await api("/api/public/store/" + slug + "/cart", "POST", { customer_name: $("#co-name")?.value || "", phone, items: state.cart.map(c => ({ product_id: c.id, qty: c.qty })) });
+      toast(r.message, "ok");
+    } catch (e) { toast(e.message, "err"); }
+  },
+  async submitReview() {
+    try {
+      const slug = state.publicData.company.slug;
+      const r = await api("/api/public/store/" + slug + "/review", "POST", { product_id: Number($("#rv-product").value), customer_name: $("#rv-name").value, rating: Number($("#rv-rating").value), comment: $("#rv-comment").value });
+      toast(r.message, "ok"); state.publicData = await api("/api/public/store/" + slug); state._renderStore();
+    } catch (e) { toast(e.message, "err"); }
+  },
   go: (r) => { location.hash = "#/" + r; if (state.route === r) route(); },
   toggleDark: () => { state.dark = !state.dark; document.body.classList.toggle("dark", state.dark); localStorage.setItem("pv_dark", state.dark ? "1" : "0"); route(); },
   askAi: (text) => { state.pendingAi = text; App.go("agente"); },
