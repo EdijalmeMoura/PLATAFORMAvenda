@@ -85,9 +85,22 @@ curl -X POST localhost:8000/api/auth/login -H 'Content-Type: application/json' \
 # GET /api/dashboard · /api/insights · /api/reports · POST /api/ai/chat · /api/campaigns/generate …
 ```
 
+## 🔌 Integrações reais (implementadas)
+
+Configuráveis por empresa em **Admin & Planos → Integrações reais**, com credenciais mascaradas, **teste de conexão real** e webhooks — guia completo em [INTEGRACOES.md](INTEGRACOES.md):
+
+| Integração | O que funciona de verdade |
+|---|---|
+| **WhatsApp Cloud API (Meta)** | Envio de texto/template pela Graph API, **recebimento de mensagens e status (lido/entregue) via webhook**, histórico no painel |
+| **Mercado Pago** | **Pix com QR Code/copia e cola** e **cartão (Checkout Pro)** na loja e no botão *Cobrar* dos pedidos; webhook/IPN marca o pedido como pago automaticamente |
+| **SMTP** | Envio real de e-mail (Central, clientes e campanhas em massa para consentidos) |
+| **Google Places API (New)** | Prospecção IA com empresas reais (endereço, telefone comercial, site, avaliação) |
+| **Meta Social** | Teste/validação de Página do Facebook/Instagram pelas APIs oficiais |
+
+Sem credencial configurada, nada é simulado: envios ficam em fila, cobranças não são criadas e o erro do provedor é mostrado com a explicação.
+
 ## 🔮 Próximos passos sugeridos
 
-1. Conectar WhatsApp Cloud API (templates aprovados pela Meta) e gateway de pagamento (Pix/cartão).
-2. Plugar Google Places API na prospecção e Meta Graph API no agendamento.
-3. Trocar/complementar o motor de IA local por LLM externo com a chave da plataforma.
-4. Billing real dos planos (assinaturas) e domínio customizado por loja.
+1. Trocar/complementar o motor de IA local por LLM externo com a chave da plataforma.
+2. Billing real dos planos (assinaturas recorrentes) e domínio customizado por loja.
+3. Publicação automática no Instagram após aprovação de permissões da Meta.

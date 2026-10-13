@@ -286,7 +286,7 @@ async function renderPublicStore(slug) {
     ${state.cart.length ? state.cart.map((c, i) => `<div class="row between" style="padding:7px 0;border-bottom:1px solid var(--line)"><span>${esc(c.icon || "")} ${esc(c.name)}</span><span class="row"><button class="icon-btn" onclick="App.cartQty(${i},-1)">−</button><b>${c.qty}</b><button class="icon-btn" onclick="App.cartQty(${i},1)">+</button><b>${money(c.price * c.qty)}</b><button class="icon-btn" onclick="App.cartRemove(${i})">🗑️</button></span></div>`).join("") + `<p class="row between mt"><span>Total</span><b style="font-size:19px">${money(cartTotal)}</b></p>
     <form id="checkout-form"><div class="grid g3"><div><label class="f">Seu nome</label><input id="co-name" required></div><div><label class="f">WhatsApp</label><input id="co-phone"></div><div><label class="f">E-mail</label><input id="co-email" type="email"></div></div>
     <label class="f">Cupom de desconto</label><input id="co-coupon" placeholder="Ex.: BEMVINDO10">
-    <label class="f">Pagamento</label><select id="co-pay"><option>Pix (confirmar no WhatsApp)</option><option>Cartão (link de pagamento)</option><option>Dinheiro na entrega/retirada</option></select>
+    <label class="f">Pagamento</label><select id="co-pay">${data.payments && data.payments.pix ? `<option value="pix">📱 Pix — Mercado Pago (QR Code na hora)</option><option value="card">💳 Cartão — Mercado Pago (link seguro)</option>` : ""}<option value="manual">💬 Combinar pagamento com a loja (WhatsApp/dinheiro)</option></select>${data.payments && data.payments.mercadopago ? `<p class="small mut">🔒 Pagamentos processados pelo Mercado Pago. Pedidos Pix/cartão são confirmados automaticamente quando o pagamento é aprovado.</p>` : ""}
     <button class="btn block mt" style="background:${color}" type="submit">Finalizar pedido · ${money(cartTotal)} →</button><p class="small mut">Frete/entrega combinados pelo WhatsApp após o pedido. Sem spam: só falamos sobre o seu pedido.</p></form>`
     : `<p class="mut">Seu carrinho está vazio. Adicione um produto acima 👆</p>`}</div>
     <p class="small mut" style="text-align:center;margin:22px 0">Loja criada com <b>ProdutoVenda IA</b> 🚀 — Você cadastra o que vende. A IA transforma em vendas.</p></div>`;
@@ -294,8 +294,12 @@ async function renderPublicStore(slug) {
     if (form) form.onsubmit = async (e) => {
       e.preventDefault();
       try {
-        const r = await api("/api/public/store/" + slug + "/checkout", "POST", { customer_name: $("#co-name").value, phone: $("#co-phone").value, email: $("#co-email").value, coupon: $("#co-coupon").value, items: state.cart.map(c => ({ product_id: c.id, qty: c.qty })) });
-        state.cart = []; openModal(`<div style="text-align:center"><div style="font-size:52px">🎉</div><h2>Pedido #${r.order_id} confirmado!</h2><p class="mut">${esc(r.message)}<br>Total: <b>${money(r.total)}</b>${r.discount ? ` (desconto de ${money(r.discount)} aplicado 🎟️)` : ""}</p><button class="btn" onclick="App.closeModal();location.reload()">Continuar comprando</button></div>`);
+        const r = await api("/api/public/store/" + slug + "/checkout", "POST", { customer_name: $("#co-name").value, phone: $("#co-phone").value, email: $("#co-email").value, coupon: $("#co-coupon").value, payment_method: $("#co-pay").value, items: state.cart.map(c => ({ product_id: c.id, qty: c.qty })) });
+        state.cart = []; state._lastPayment = r.payment || null;
+        const payHtml = !r.payment ? "" : r.payment.status === "erro" ? `<div class="card" style="background:var(--panel2)"><b>⚠️ Cobrança não gerada</b><p class="small">${esc(r.payment.error || "")}</p><p class="small mut">Seu pedido foi registrado e a loja concluirá o pagamento com você.</p></div>`
+          : r.payment.method === "pix" ? `<div class="card" style="background:var(--panel2)"><h3>📱 Pague com Pix</h3>${r.payment.qr_code_base64 ? `<img src="data:image/png;base64,${r.payment.qr_code_base64}" alt="QR Code Pix" style="width:210px;height:210px;border-radius:14px;border:1px solid var(--line)">` : ""}<p class="small"><b>Pix copia e cola:</b></p><textarea readonly onclick="this.select()">${esc(r.payment.qr_code || "")}</textarea><button class="btn sm mt" onclick="App.copyText(state._lastPayment.qr_code,'Pix copia e cola copiado!')">📋 Copiar código Pix</button><p class="small mut">Assim que o Pix for aprovado, seu pedido é confirmado automaticamente. 💚</p></div>`
+          : `<div class="card" style="background:var(--panel2)"><h3>💳 Pagar com cartão</h3><p class="small mut">Você será direcionado ao ambiente seguro do Mercado Pago.</p><a class="btn block" href="${esc(r.payment.checkout_url)}" target="_blank" rel="noopener">Ir para o pagamento seguro →</a></div>`;
+        openModal(`<div style="text-align:center"><div style="font-size:52px">${r.payment && r.payment.status !== "erro" && r.order_status === "aguardando pagamento" ? "🧾" : "🎉"}</div><h2>Pedido #${r.order_id} ${r.order_status === "aguardando pagamento" ? "criado!" : "confirmado!"}</h2><p class="mut">${esc(r.message)}<br>Total: <b>${money(r.total)}</b>${r.discount ? ` (desconto de ${money(r.discount)} aplicado 🎟️)` : ""}</p>${payHtml}<button class="btn mt" onclick="App.closeModal();location.reload()">Continuar comprando</button></div>`);
         render();
       } catch (err) { toast(err.message, "err"); }
     };
@@ -305,10 +309,12 @@ async function renderPublicStore(slug) {
 
 /* ================= PEDIDOS / CLIENTES / CRM ================= */
 async function viewPedidos() {
-  const { orders } = await api("/api/orders");
-  shell(`<div class="row between mb"><p class="mut" style="margin:0">Pedidos da loja, WhatsApp e canais — com lucro estimado por pedido.</p><button class="btn" onclick="App.orderForm()">+ Novo pedido manual</button></div>
-  <div class="card"><table><tr><th>#</th><th>Cliente</th><th>Canal</th><th>Total</th><th>Lucro est.</th><th>Cupom</th><th>Data</th><th>Status</th></tr>
-  ${orders.map(o => `<tr><td>#${o.id}</td><td><b>${esc(o.customer_name)}</b></td><td>${esc(o.channel)}</td><td><b>${money(o.total)}</b></td><td>${money(o.profit)}</td><td>${o.coupon ? badge(o.coupon, "b-violet") : "-"}</td><td class="small">${esc((o.created_at || "").slice(0, 10))}</td><td><select onchange="App.put('/api/orders/${o.id}',{status:this.value},'Status atualizado')" style="width:auto;padding:6px 9px">${["pendente", "pago", "entregue", "concluido", "cancelado"].map(s => `<option ${o.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></td></tr>`).join("") || '<tr><td colspan="8" class="mut">Nenhum pedido ainda.</td></tr>'}</table></div>`, "Pedidos");
+  const [{ orders }, pays] = await Promise.all([api("/api/orders"), api("/api/payments").catch(() => ({ payments: [] }))]);
+  const payments = pays.payments || [];
+  shell(`<div class="row between mb"><p class="mut" style="margin:0">Pedidos da loja, WhatsApp e canais — com lucro estimado por pedido. Cobre qualquer pedido com <b>Pix ou cartão reais (Mercado Pago)</b>.</p><button class="btn" onclick="App.orderForm()">+ Novo pedido manual</button></div>
+  <div class="card"><table><tr><th>#</th><th>Cliente</th><th>Canal</th><th>Total</th><th>Lucro est.</th><th>Cupom</th><th>Data</th><th>Status</th><th></th></tr>
+  ${orders.map(o => `<tr><td>#${o.id}</td><td><b>${esc(o.customer_name)}</b></td><td>${esc(o.channel)}</td><td><b>${money(o.total)}</b></td><td>${money(o.profit)}</td><td>${o.coupon ? badge(o.coupon, "b-violet") : "-"}</td><td class="small">${esc((o.created_at || "").slice(0, 10))}</td><td><select onchange="App.put('/api/orders/${o.id}',{status:this.value},'Status atualizado')" style="width:auto;padding:6px 9px">${["pendente", "aguardando pagamento", "pago", "entregue", "concluido", "cancelado"].map(s => `<option ${o.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></td><td>${o.status !== "pago" && o.status !== "entregue" && o.status !== "concluido" ? `<button class="btn sm" onclick="App.chargeOrder(${o.id},${o.total})">💳 Cobrar</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="9" class="mut">Nenhum pedido ainda.</td></tr>'}</table></div>
+  <div class="card mt"><h3>💰 Pagamentos (Mercado Pago)</h3>${payments.length ? `<table><tr><th>#</th><th>Pedido</th><th>Método</th><th>Valor</th><th>Status no MP</th><th>ID externo</th><th></th></tr>${payments.map(p => `<tr><td>${p.id}</td><td>${p.order_id ? "#" + p.order_id : "—"}</td><td>${p.method === "pix" ? "📱 Pix" : "💳 Cartão/Link"}</td><td><b>${money(p.amount)}</b></td><td>${badge(p.status, p.status === "approved" ? "b-green" : p.status === "rejected" ? "b-red" : "b-amber")}</td><td class="small">${esc(p.external_id)}</td><td><span class="row">${p.method === "pix" && p.qr_code ? `<button class="btn sm ghost" onclick="App.copyText(\`${esc(p.qr_code).slice(0, 4000)}\`,'Pix copia e cola copiado!')">📋 Pix</button>` : ""}${p.checkout_url ? `<a class="btn sm ghost" href="${esc(p.checkout_url)}" target="_blank" rel="noopener">Abrir link</a>` : ""}<button class="btn sm soft" onclick="App.refreshPayment(${p.id})">🔄 Atualizar status</button></span></td></tr>`).join("")}</table>` : '<p class="mut">Nenhum pagamento gerado ainda. Configure o Mercado Pago em Admin & Planos → Integrações e use o botão <b>Cobrar</b> em um pedido — ou venda pela loja com Pix/cartão.</p>'}</div>`, "Pedidos");
 }
 async function viewClientes() {
   const { customers } = await api("/api/customers");
@@ -436,29 +442,33 @@ async function viewInsights() {
 
 /* ================= WHATSAPP / EMAIL / RELATORIOS / METAS ================= */
 async function viewWhatsapp() {
-  const [{ templates }, { customers }] = await Promise.all([api("/api/templates"), api("/api/customers")]);
-  const msgs = await api("/api/content").catch(() => ({ content: [] }));
+  const [{ templates }, { customers }, ig, hist] = await Promise.all([api("/api/templates"), api("/api/customers"), api("/api/integrations").catch(() => ({ integrations: [] })), api("/api/messages").catch(() => ({ messages: [] }))]);
+  state._integrations = ig.integrations || [];
+  const wa = state._integrations.find(i => i.provider === "whatsapp") || {};
   state._waCustomers = customers; state._waTemplates = templates;
-  shell(`<div class="card mb"><h3>💬 Central WhatsApp</h3><p class="mut">Preparada para a integração oficial <b>WhatsApp Business / Cloud API</b> (Meta): templates aprovados, atendimento, histórico, automações e campanhas apenas para contatos que autorizaram. <b>Nunca spam.</b> Enquanto a API não está conectada, as mensagens ficam registradas na fila — nada é fingido como enviado.</p></div>
-  <div class="grid g2"><div class="card"><h3>📤 Enviar mensagem</h3><form id="wa-form">
+  shell(`<div class="card mb"><div class="row between"><div><h3>💬 Central WhatsApp — Cloud API (Meta)</h3><p class="mut">${wa.connected ? "✅ <b>Conectada e ativa:</b> os envios abaixo saem de verdade pela Graph API e as respostas dos clientes chegam pelo webhook." : "⚠️ <b>Não conectada:</b> configure Phone Number ID + token em Admin & Planos → Integrações. Sem conexão, as mensagens ficam na fila — nada é fingido como enviado."} Atendimento e campanhas só para contatos que autorizaram. <b>Nunca spam.</b></p></div><span class="row"><button class="btn soft" onclick="App.integrationForm('whatsapp')">⚙️ Configurar WhatsApp</button>${wa.configured ? `<button class="btn ghost" onclick="App.testIntegration('whatsapp')">🔌 Testar conexão</button>` : ""}</span></div>
+  ${wa.webhook_url ? `<p class="small mut">Webhook p/ receber mensagens (cole na Meta): <a href="#" onclick="event.preventDefault();App.copyText('${esc(wa.webhook_url)}')">${esc(wa.webhook_url)}</a> 📋</p>` : ""}</div>
+  <div class="grid g2"><div class="card"><h3>📤 Enviar mensagem ${wa.connected ? "(envio real)" : "(fila)"}</h3><form id="wa-form">
   <label class="f">Cliente (somente com consentimento)</label><select id="wa-customer">${customers.map(c => `<option value="${c.id}">${esc(c.name)} ${c.consent ? "✓" : "✕ sem consentimento"}</option>`).join("")}</select>
-  <label class="f">Template</label><select id="wa-template" onchange="App.fillTemplate()"><option value="">— Escrever do zero —</option>${templates.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select>
+  <label class="f">Template interno (preenche o texto)</label><select id="wa-template" onchange="App.fillTemplate()"><option value="">— Escrever do zero —</option>${templates.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select>
+  <label class="f">Template aprovado na Meta (opcional — fora da janela de 24h use um template aprovado)</label><input id="wa-template-name" placeholder="Ex.: hello_world (deixe vazio p/ texto livre)">
   <label class="f">Mensagem</label><textarea id="wa-content" placeholder="Use {nome} para personalizar"></textarea>
-  <button class="btn block mt" type="submit">Registrar envio (fila oficial)</button></form></div>
+  <button class="btn block mt" type="submit">${wa.connected ? "Enviar via WhatsApp Cloud API →" : "Registrar na fila"}</button></form></div>
   <div class="card"><h3>📝 Templates</h3>${templates.map(t => `<div style="padding:9px 0;border-bottom:1px solid var(--line)"><b class="small">${esc(t.name)}</b> ${badge(t.channel, "b-violet")}<p class="small mut" style="margin:3px 0">${esc(t.content)}</p><button class="btn sm ghost" onclick="App.del('/api/templates/${t.id}','Template removido')">🗑️</button></div>`).join("")}
-  <button class="btn sm soft mt" onclick="App.templateForm()">+ Novo template</button></div></div>`, "WhatsApp Business");
+  <button class="btn sm soft mt" onclick="App.templateForm()">+ Novo template</button></div></div>
+  <div class="card mt"><h3>🕘 Histórico de mensagens (enviadas e recebidas)</h3>${(hist.messages || []).length ? (hist.messages || []).map(m => `<div style="padding:8px 0;border-bottom:1px solid var(--line)"><span class="row between"><span>${m.direction === "in" ? "📥" : "📤"} <b>${esc(m.customer_name || "Cliente")}</b> <span class="small mut">${esc(m.channel)} · ${esc((m.created_at || "").slice(0, 16).replace("T", " "))}</span></span>${badge(m.status || "", String(m.status || "").startsWith("enviado") || String(m.status || "").startsWith("recebido") ? "b-green" : String(m.status || "").startsWith("falha") ? "b-red" : "b-amber")}</span><p class="small" style="margin:4px 0">${esc(m.content)}</p></div>`).join("") : '<p class="mut">Nenhuma mensagem ainda. As recebidas pelo webhook aparecem aqui automaticamente.</p>'}</div>`, "WhatsApp Business");
   $("#wa-form").onsubmit = async (e) => {
     e.preventDefault();
     const cust = state._waCustomers.find(c => c.id === Number($("#wa-customer").value));
     const content = ($("#wa-content").value || "").replace("{nome}", (cust?.name || "").split(" ")[0]);
-    try { const r = await api("/api/messages/send", "POST", { customer_id: Number($("#wa-customer").value), channel: "WhatsApp", content }); toast("✅ " + r.note, "ok"); }
+    try { const r = await api("/api/messages/send", "POST", { customer_id: Number($("#wa-customer").value), channel: "WhatsApp", content, template_name: $("#wa-template-name").value.trim() }); toast("✅ " + r.note, "ok"); viewWhatsapp(); }
     catch (err) { toast(err.message, "err"); }
   };
 }
 async function viewEmail() {
   const { email_campaigns } = await api("/api/email-campaigns");
   shell(`<div class="row between mb"><p class="mut" style="margin:0">Campanhas, segmentação e sequências com assunto e CTA gerados por IA. Envio real via provedor conectado, sempre com opt-out.</p><button class="btn" onclick="App.emailForm()">+ Nova campanha de e-mail</button></div>
-  <div class="grid g2">${email_campaigns.map(c => `<div class="card"><div class="row between"><b>${esc(c.subject)}</b>${statusBadge(c.status)}</div><p class="small mut">Segmento: ${esc(c.segment)} · Enviados ${c.sent || 0} · Aberturas ${c.opens || 0} · Cliques ${c.clicks || 0}</p><p class="small" style="white-space:pre-wrap">${esc((c.content || "").slice(0, 240))}</p><div class="row"><button class="btn sm ghost" onclick="App.put('/api/email-campaigns/${c.id}',{status:'agendada'},'Campanha agendada (envio via provedor conectado)')">Agendar</button><button class="btn sm ghost" onclick="App.del('/api/email-campaigns/${c.id}','Campanha removida')">🗑️</button></div></div>`).join("") || '<div class="empty">Nenhuma campanha de e-mail ainda. Crie a primeira com ajuda da IA ✨</div>'}</div>`, "E-mail Marketing");
+  <div class="grid g2">${email_campaigns.map(c => `<div class="card"><div class="row between"><b>${esc(c.subject)}</b>${statusBadge(c.status)}</div><p class="small mut">Segmento: ${esc(c.segment)} · Enviados ${c.sent || 0} · Aberturas ${c.opens || 0} · Cliques ${c.clicks || 0}</p><p class="small" style="white-space:pre-wrap">${esc((c.content || "").slice(0, 240))}</p><div class="row"><button class="btn sm" onclick="App.sendEmailCampaign(${c.id})">✉️ Enviar agora (SMTP)</button><button class="btn sm ghost" onclick="App.put('/api/email-campaigns/${c.id}',{status:'agendada'},'Campanha agendada')">Agendar</button><button class="btn sm ghost" onclick="App.del('/api/email-campaigns/${c.id}','Campanha removida')">🗑️</button></div></div>`).join("") || '<div class="empty">Nenhuma campanha de e-mail ainda. Crie a primeira com ajuda da IA ✨</div>'}</div>`, "E-mail Marketing");
 }
 async function viewRelatorios() {
   const r = await api("/api/reports");
@@ -485,8 +495,19 @@ async function viewMetas() {
 /* ================= ADMIN / CONFIG ================= */
 async function viewAdmin() {
   const a = await api("/api/admin");
+  const ig = await api("/api/integrations").catch(() => ({ integrations: [] }));
+  state._integrations = ig.integrations || [];
   shell(`<div class="card mb"><h3>🛡️ Administração da plataforma</h3><p class="mut">Usuários, planos, assinaturas, uso de IA, integrações, logs e métricas. Cada empresa (tenant) só enxerga os próprios dados.</p>
   <div class="row mt">${Object.entries(a.counts).map(([k, v]) => badge(k + ": " + v, "b-violet")).join("")} ${badge("Ações de IA no mês: " + a.usage.actions, "b-green")} ${badge("Tokens estimados: " + a.usage.tokens, "b-gray")}</div></div>
+  <div class="card mb"><h3>🔌 Integrações reais</h3><p class="mut">Conecte suas credenciais oficiais — elas ficam salvas <b>apenas no servidor da sua empresa</b>, sempre mascaradas na tela, e nada é simulado: o botão <b>Testar conexão</b> faz uma chamada real à API. Guia passo a passo no arquivo <b>INTEGRACOES.md</b> do projeto.</p>
+  <div class="grid g2 mt">${state._integrations.map(it => `<div style="border:1px solid var(--line);border-radius:14px;padding:15px">
+    <div class="row between"><b>${esc(it.icon)} ${esc(it.name)}</b>${it.connected ? badge("● Conectada e ativa", "b-green") : it.configured ? badge("Configurada (desativada)", "b-amber") : badge("Não configurada", "b-gray")}</div>
+    <p class="small mut" style="margin:7px 0">${esc(it.desc)}</p>
+    ${it.missing && it.missing.length ? `<p class="small">Faltam: <b>${it.missing.join(", ")}</b></p>` : ""}
+    ${it.last_test_status ? `<p class="small mut">Último teste: ${it.last_test_status === "sucesso" ? "✅" : "❌"} ${esc(it.last_test_detail || "")} <span>(${esc((it.last_test_at || "").slice(0, 16).replace("T", " "))})</span></p>` : ""}
+    ${it.webhook_url ? `<p class="small mut">Webhook (cole no provedor):<br><a href="#" onclick="event.preventDefault();App.copyText('${esc(it.webhook_url)}','URL do webhook copiada!')">${esc(it.webhook_url)}</a> 📋</p>` : ""}
+    <div class="row mt"><button class="btn sm" onclick="App.integrationForm('${it.provider}')">⚙️ Configurar</button><button class="btn sm soft" onclick="App.testIntegration('${it.provider}')" ${it.configured ? "" : "disabled"}>🔌 Testar conexão</button>
+    ${it.configured ? `<button class="btn sm ghost" onclick="App.toggleIntegration('${it.provider}',${it.active ? 0 : 1})">${it.active ? "Desativar" : "Ativar"}</button>` : ""}</div></div>`).join("")}</div></div>
   <h3 class="mb">💎 Planos (limites configuráveis)</h3><div class="grid g4">${a.plans.map(p => { const lim = JSON.parse(p.limits || "{}"); const current = state.me.company.plan_id === p.id; return `<div class="card" style="${current ? "border:2px solid var(--brand)" : ""}"><b>${esc(p.name)}</b>${current ? ' ' + badge("PLANO ATUAL", "b-violet") : ""}<div class="val" style="font-size:24px;font-weight:850;margin:8px 0">${p.price ? money(p.price) + "<span class='small mut'>/mês</span>" : "Grátis"}</div><p class="small mut" style="line-height:1.8">${Object.entries(lim).map(([k, v]) => `${k}: <b>${v >= 9999 ? "ilimitado" : v}</b>`).join("<br>")}</p>${current ? "" : `<button class="btn sm block mt" onclick="App.changePlan(${p.id})">Assinar/alterar</button>`}</div>`; }).join("")}</div>
   <div class="grid g2 mt"><div class="card"><h3>👥 Usuários da empresa</h3>${a.users.map(u => `<div class="row between" style="padding:8px 0;border-bottom:1px solid var(--line)"><span><b>${esc(u.name)}</b><br><span class="small mut">${esc(u.email)}</span></span>${badge(u.role, "b-violet")}</div>`).join("")}</div>
   <div class="card"><h3>🔌 Integrações (APIs oficiais)</h3>${a.integrations.map(i => `<div style="padding:9px 0;border-bottom:1px solid var(--line)"><div class="row between"><b class="small">${esc(i.name)}</b>${badge(i.status, "b-amber")}</div><p class="small mut" style="margin:3px 0">${esc(i.desc)}</p></div>`).join("")}</div></div>
@@ -703,6 +724,59 @@ const App = {
       { name: "content", label: "Conteúdo", type: "textarea", placeholder: "Escreva ou peça ao Sales Agent: 'crie um e-mail para reativar clientes'" },
       { name: "status", label: "Status", type: "select", options: ["rascunho", "agendada"] },
     ], "Salvar campanha ✉️", async (out) => { if (!out.subject) throw new Error("Informe o assunto."); await api("/api/email-campaigns", "POST", out); toast("Campanha salva! ✉️", "ok"); viewEmail(); });
+  },
+  integrationForm(provider) {
+    const it = (state._integrations || []).find(x => x.provider === provider); if (!it) return;
+    const fields = it.fields.map(f => ({
+      name: f.name, label: f.label + (f.secret ? " 🔒" : ""), type: f.secret ? "password" : "text",
+      value: f.secret ? "" : (it.config[f.name] || ""),
+      placeholder: f.secret ? (it.config[f.name] ? `Atual: ${it.config[f.name]} — deixe vazio para manter` : (f.placeholder || "")) : (f.placeholder || ""),
+    }));
+    fields.push({ name: "__active", label: "Integração ativa (envios/pagamentos reais ligados)", type: "checkbox", value: it.active ? 1 : 0 });
+    formModal(`${it.icon} Configurar — ${it.name}`, fields, "Salvar credenciais", async (out) => {
+      const active = out.__active; delete out.__active;
+      Object.keys(out).forEach(k => { if (out[k] === "") delete out[k]; });
+      const r = await api("/api/integrations/" + provider, "PUT", { config: out, active: !!active });
+      toast(r.message, "ok");
+      viewAdmin();
+    });
+    toast("🔒 Segredos nunca aparecem inteiros na tela — ficam só no servidor.");
+  },
+  async testIntegration(provider) {
+    toast("🔌 Testando conexão real com a API…");
+    try { const r = await api(`/api/integrations/${provider}/test`, "POST", {}); toast(r.message, "ok"); viewAdmin(); }
+    catch (e) { toast(e.message, "err"); viewAdmin(); }
+  },
+  async toggleIntegration(provider, active) {
+    try { await api("/api/integrations/" + provider, "PUT", { config: {}, active: !!active }); toast(active ? "Integração ativada ✅" : "Integração desativada", "ok"); viewAdmin(); }
+    catch (e) { toast(e.message, "err"); }
+  },
+  chargeOrder(id, total) {
+    openModal(`<div class="row between"><h3 style="margin:0">💳 Cobrar pedido #${id} — ${money(total)}</h3><button class="icon-btn" onclick="App.closeModal()">✕</button></div>
+    <p class="mut">Gera uma cobrança real no Mercado Pago (requer integração configurada e ativa).</p>
+    <div class="grid g2 mt"><button class="btn" onclick="App.createCharge(${id},'pix')">📱 Gerar Pix (QR Code)</button><button class="btn soft" onclick="App.createCharge(${id},'card')">💳 Gerar link de cartão</button></div>
+    <div id="charge-result" class="mt"></div>`);
+  },
+  async createCharge(orderId, method) {
+    const box = $("#charge-result"); if (box) box.innerHTML = "Gerando cobrança no Mercado Pago…";
+    try {
+      const r = await api("/api/payments/create", "POST", { order_id: orderId, method });
+      const p = r.payment; state._lastPayment = p;
+      const html = method === "pix"
+        ? `${p.qr_code_base64 ? `<img src="data:image/png;base64,${p.qr_code_base64}" alt="QR Code Pix" style="width:210px;height:210px;border-radius:14px;border:1px solid var(--line)">` : ""}<p class="small"><b>Pix copia e cola:</b></p><textarea readonly onclick="this.select()">${esc(p.qr_code || "")}</textarea><button class="btn sm mt" onclick="App.copyText(state._lastPayment.qr_code,'Pix copia e cola copiado!')">📋 Copiar código Pix</button>`
+        : `<p>Link de pagamento (cartão/Checkout Pro):</p><p><a href="${esc(p.checkout_url)}" target="_blank" rel="noopener">${esc(p.checkout_url)}</a></p><button class="btn sm" onclick="App.copyText(state._lastPayment.checkout_url,'Link copiado!')">📋 Copiar link</button>`;
+      if (box) box.innerHTML = `<div class="card" style="background:var(--panel2);text-align:center"><b>✅ Cobrança criada!</b><p class="small mut">Status inicial: ${esc(p.status)} · ID Mercado Pago: ${esc(p.external_id)}</p>${html}<p class="small mut mt">Quando o cliente pagar, o webhook do Mercado Pago marca o pedido como <b>pago</b> automaticamente. Você também pode conferir em Pedidos → Pagamentos.</p></div>`;
+      toast(r.message, "ok");
+    } catch (e) { if (box) box.innerHTML = `<div class="card" style="background:var(--panel2)">❌ ${esc(e.message)}</div>`; toast(e.message, "err"); }
+  },
+  async refreshPayment(id) {
+    try { const r = await api(`/api/payments/${id}/refresh`, "POST", {}); toast(`Status no Mercado Pago: ${r.payment.status}`, "ok"); viewPedidos(); }
+    catch (e) { toast(e.message, "err"); }
+  },
+  async sendEmailCampaign(id) {
+    if (!confirm("Enviar esta campanha agora via SMTP para todos os clientes que autorizaram contato?")) return;
+    try { const r = await api(`/api/email-campaigns/${id}/send`, "POST", {}); toast(r.message, "ok"); viewEmail(); }
+    catch (e) { toast(e.message, "err"); }
   },
   async changePlan(id) { try { await api("/api/admin/plan", "POST", { plan_id: id }); state.me = await api("/api/auth/me"); toast("Plano atualizado! 💎", "ok"); viewAdmin(); } catch (e) { toast(e.message, "err"); } },
 };

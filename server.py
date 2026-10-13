@@ -6,6 +6,8 @@ Nenhuma dependencia externa. Dados persistentes em plataformavenda.db
 """
 import json, os, re, sqlite3, hashlib, secrets, random, datetime, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import integrations as integ
+from integrations import IntegrationError
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "plataformavenda.db")
@@ -70,6 +72,11 @@ CREATE TABLE IF NOT EXISTS ai_usage(id INTEGER PRIMARY KEY AUTOINCREMENT, compan
 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, title TEXT, body TEXT, kind TEXT DEFAULT 'info', read_flag INTEGER DEFAULT 0, created_at TEXT);
 CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, user_id INTEGER, action TEXT, detail TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS email_campaigns(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, subject TEXT, content TEXT, segment TEXT DEFAULT 'Todos', status TEXT DEFAULT 'rascunho', sent INTEGER DEFAULT 0, opens INTEGER DEFAULT 0, clicks INTEGER DEFAULT 0, created_at TEXT);
+CREATE TABLE IF NOT EXISTS integrations(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, provider TEXT, config TEXT DEFAULT '{}', active INTEGER DEFAULT 1,
+  last_test_at TEXT, last_test_status TEXT, last_test_detail TEXT, created_at TEXT, updated_at TEXT, UNIQUE(company_id, provider));
+CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, order_id INTEGER, provider TEXT DEFAULT 'mercadopago', external_id TEXT DEFAULT '',
+  method TEXT DEFAULT 'pix', amount REAL DEFAULT 0, status TEXT DEFAULT 'pending', qr_code TEXT DEFAULT '', qr_code_base64 TEXT DEFAULT '', checkout_url TEXT DEFAULT '',
+  raw TEXT DEFAULT '', created_at TEXT, updated_at TEXT);
 """
 
 def now():
@@ -367,6 +374,9 @@ def seed(conn):
 def init_db():
     conn = db()
     conn.executescript(SCHEMA)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)")]
+    if "external_id" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN external_id TEXT DEFAULT ''")
     conn.commit()
     seed(conn)
     conn.close()
@@ -390,6 +400,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_text(self, text, status=200):
+        body = str(text).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def base_url(self):
+        host = self.headers.get("Host") or "localhost:8000"
+        proto = self.headers.get("X-Forwarded-Proto") or ("https" if host.endswith(".e2b.app") or ".app" in host else "http")
+        return f"{proto}://{host}"
 
     def body_json(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -484,13 +507,43 @@ class Handler(BaseHTTPRequestHandler):
             settings = conn.execute("SELECT * FROM store_settings WHERE company_id=?", (company["id"],)).fetchone()
             products = [dict(r) for r in conn.execute("SELECT * FROM products WHERE company_id=? AND status='ativo' ORDER BY sales DESC", (company["id"],))]
             reviews = [dict(r) for r in conn.execute("SELECT * FROM reviews WHERE company_id=? ORDER BY id DESC LIMIT 6", (company["id"],))]
-            return self.send_json({"company": dict(company), "settings": dict(settings) if settings else {}, "products": products, "reviews": reviews})
+            mp_cfg = integ.get_config(conn, company["id"], "mercadopago", active_only=True)
+            mp_on = integ.configured_status("mercadopago", mp_cfg)[0]
+            return self.send_json({"company": dict(company), "settings": dict(settings) if settings else {}, "products": products, "reviews": reviews,
+                                   "payments": {"mercadopago": mp_on, "pix": mp_on, "card": mp_on}})
         m = re.match(r"^/api/public/store/([\w-]+)/checkout$", path)
         if m and method == "POST":
             company = conn.execute("SELECT * FROM companies WHERE slug=?", (m.group(1),)).fetchone()
             if not company:
                 return self.send_json({"error": "Loja não encontrada"}, 404)
             return self.public_checkout(conn, company, data)
+
+        # ---------------- Webhooks publicos (Meta / Mercado Pago) ----------------
+        if path == "/api/webhooks/whatsapp" and method == "GET":
+            def q1(key):
+                v = query.get(key)
+                return (v[0] if isinstance(v, list) and v else v) or ""
+            mode, token, challenge = q1("hub.mode"), q1("hub.verify_token"), q1("hub.challenge")
+            if mode == "subscribe" and token:
+                rows = conn.execute("SELECT company_id, config FROM integrations WHERE provider='whatsapp'").fetchall()
+                for r in rows:
+                    try:
+                        cfg = json.loads(r["config"] or "{}")
+                    except Exception:
+                        cfg = {}
+                    if cfg.get("verify_token") and cfg["verify_token"] == token:
+                        return self.send_text(challenge, 200)
+            return self.send_text("Forbidden", 403)
+        if path == "/api/webhooks/whatsapp" and method == "POST":
+            return self.webhook_whatsapp(conn, data)
+        if path in ("/api/webhooks/mercadopago", "/api/webhooks/mercadopago/") and method in ("GET", "POST"):
+            pid = ""
+            if method == "GET":
+                v = query.get("data.id") or query.get("id")
+                pid = (v[0] if isinstance(v, list) and v else v) or ""
+            else:
+                pid = str(((data.get("data") or {}).get("id")) or data.get("id") or "")
+            return self.webhook_mercadopago(conn, pid)
 
         # Auth
         if path == "/api/auth/register" and method == "POST":
@@ -529,6 +582,90 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ai/history" and method == "GET":
             rows = [dict(r) for r in conn.execute("SELECT * FROM ai_conversations WHERE company_id=? ORDER BY id DESC LIMIT 30", (cid,))]
             return self.send_json({"history": list(reversed(rows))})
+
+        # ---------------- Integracoes reais ----------------
+        if path == "/api/integrations" and method == "GET":
+            items = integ.list_integrations(conn, cid)
+            for it in items:
+                if it.get("webhook_path"):
+                    it["webhook_url"] = self.base_url() + it["webhook_path"]
+            return self.send_json({"integrations": items, "base_url": self.base_url()})
+        m = re.match(r"^/api/integrations/([a-z_]+)$", path)
+        if m and method == "PUT":
+            provider = m.group(1)
+            if provider not in integ.PROVIDERS:
+                return self.send_json({"error": "Provedor desconhecido."}, 404)
+            try:
+                integ.save_config(conn, cid, provider, data)
+            except IntegrationError as e:
+                return self.send_json({"error": str(e)}, e.status)
+            log_audit(conn, cid, user["id"], "integration_save", provider)
+            row = integ.integration_row(conn, cid, provider)
+            item = integ.public_config(provider, integ.get_config(conn, cid, provider), row)
+            if item.get("webhook_path"):
+                item["webhook_url"] = self.base_url() + item["webhook_path"]
+            return self.send_json({"integration": item, "message": f"{item['name']}: configuração salva (segredos ficam só no servidor, sempre mascarados)." })
+        m = re.match(r"^/api/integrations/([a-z_]+)/test$", path)
+        if m and method == "POST":
+            provider = m.group(1)
+            if provider not in integ.PROVIDERS:
+                return self.send_json({"error": "Provedor desconhecido."}, 404)
+            config = integ.get_config(conn, cid, provider)
+            try:
+                detail = integ.test_connection(provider, config)
+                integ.record_test(conn, cid, provider, "sucesso", detail)
+                log_audit(conn, cid, user["id"], "integration_test_ok", provider)
+                return self.send_json({"ok": True, "detail": detail, "message": "✅ Conexão real confirmada: " + detail})
+            except IntegrationError as e:
+                detail = integ.provider_error_detail(e.detail) or str(e)
+                integ.record_test(conn, cid, provider, "falha", f"{e} {detail}")
+                return self.send_json({"error": f"Teste de conexão falhou: {e} {detail}".strip()}, e.status if e.status != 502 else 502)
+        if path == "/api/payments" and method == "GET":
+            rows = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE company_id=? ORDER BY id DESC LIMIT 50", (cid,))]
+            for r in rows:
+                r.pop("raw", None)
+            return self.send_json({"payments": rows})
+        if path == "/api/payments/create" and method == "POST":
+            return self.payments_create(conn, company, user, data)
+        m = re.match(r"^/api/payments/(\d+)/refresh$", path)
+        if m and method == "POST":
+            payment = conn.execute("SELECT * FROM payments WHERE id=? AND company_id=?", (m.group(1), cid)).fetchone()
+            if not payment:
+                return self.send_json({"error": "Pagamento não encontrado"}, 404)
+            config = integ.get_config(conn, cid, "mercadopago", active_only=True)
+            try:
+                raw = integ.mp_get_payment(config, payment["external_id"])
+            except IntegrationError as e:
+                return self.send_json({"error": f"{e} {integ.provider_error_detail(e.detail)}".strip()}, e.status)
+            self.apply_mp_status(conn, payment, raw.get("status", payment["status"]), raw)
+            updated = conn.execute("SELECT * FROM payments WHERE id=?", (payment["id"],)).fetchone()
+            return self.send_json({"payment": {k: v for k, v in dict(updated).items() if k != "raw"}})
+        m = re.match(r"^/api/email-campaigns/(\d+)/send$", path)
+        if m and method == "POST":
+            camp = conn.execute("SELECT * FROM email_campaigns WHERE id=? AND company_id=?", (m.group(1), cid)).fetchone()
+            if not camp:
+                return self.send_json({"error": "Campanha não encontrada"}, 404)
+            smtp_cfg = integ.get_config(conn, cid, "smtp", active_only=True)
+            if not integ.configured_status("smtp", smtp_cfg)[0]:
+                return self.send_json({"error": "SMTP não configurado/ativo. Configure em Admin & Planos → Integrações para enviar de verdade."}, 400)
+            targets = conn.execute("SELECT * FROM customers WHERE company_id=? AND consent=1 AND email LIKE '%@%' LIMIT 500", (cid,)).fetchall()
+            sent, errors = 0, []
+            for t in targets:
+                try:
+                    integ.smtp_send(smtp_cfg, t["email"], camp["subject"], (camp["content"] or "").replace("{nome}", (t["name"] or "").split(" ")[0]))
+                    sent += 1
+                except IntegrationError as e:
+                    errors.append(str(e))
+                    if sent == 0 and len(errors) >= 3:
+                        break
+            conn.execute("UPDATE email_campaigns SET sent=sent+?, status='enviada' WHERE id=?", (sent, camp["id"]))
+            log_audit(conn, cid, user["id"], "email_campaign_send", f"{camp['subject']}: {sent} enviados")
+            if sent == 0 and errors:
+                return self.send_json({"error": f"Nenhum e-mail enviado: {errors[0]}"}, 502)
+            return self.send_json({"ok": True, "sent": sent, "message": f"✉️ {sent} e-mail(s) enviados via SMTP para clientes que autorizaram contato." + (f" {len(errors)} falha(s)." if errors else "")})
+        if path == "/api/messages" and method == "GET":
+            rows = [dict(r) for r in conn.execute("SELECT m.*, c.name customer_name FROM messages m LEFT JOIN customers c ON c.id=m.customer_id WHERE m.company_id=? ORDER BY m.id DESC LIMIT 60", (cid,))]
+            return self.send_json({"messages": rows})
 
         # Generic CRUD resources
         if self.crud(conn, method, path, data, cid, user):
@@ -590,6 +727,23 @@ class Handler(BaseHTTPRequestHandler):
             city = data.get("city") or company["city"] or "sua cidade"
             segment_filter = data.get("segment") or "Empresa"
             product_name = data.get("product") or "seu produto"
+            # --- Fonte oficial: Google Places API, quando configurada ---
+            places_cfg = integ.get_config(conn, cid, "google_places", active_only=True)
+            if integ.configured_status("google_places", places_cfg)[0]:
+                try:
+                    places = integ.places_search(places_cfg, segment_filter, city, 10)
+                    created_places = []
+                    for pl in places:
+                        if conn.execute("SELECT id FROM opportunities WHERE company_id=? AND name=?", (cid, pl["name"])).fetchone():
+                            continue
+                        cur = conn.execute("INSERT INTO opportunities(company_id,name,company,segment,city,phone,email,site,source,status,potential,notes,last_interaction,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                           (cid, pl["name"], pl["name"], segment_filter, city, pl["phone"], "", pl["site"], "Google Places API (fonte oficial)", "Nova", "Alto" if (pl["rating"] or 0) and float(pl["rating"]) >= 4.5 else "Médio",
+                                            f"Endereço: {pl['address']}" + (f" · Avaliação Google: {pl['rating']}★" if pl["rating"] else "") + f" · Potencial para {product_name}. Validar contato pelos canais oficiais; sem spam.", today(), now()))
+                        created_places.append(dict(conn.execute("SELECT * FROM opportunities WHERE id=?", (cur.lastrowid,)).fetchone()))
+                    ai_log(conn, cid, "prospect_places", f"{segment_filter} em {city}: {len(created_places)} via Google Places")
+                    return self.send_json({"created": created_places, "source": "google_places", "message": f"📍 {len(created_places)} novas oportunidades REAIS encontradas via Google Places para {segment_filter} em {city} (as demais já estavam na base). Aborde só por canais oficiais, sem spam."})
+                except IntegrationError as e:
+                    return self.send_json({"error": f"Google Places falhou: {e} {integ.provider_error_detail(e.detail)}".strip()}, e.status)
             created = []
             bases = [(s, names) for s, names in PROSPECT_BASE if segment_filter in ("", "Todos", s) or segment_filter == "Empresa" and s in ("Empresa", "Loja")]
             if not bases:
@@ -631,10 +785,42 @@ class Handler(BaseHTTPRequestHandler):
             if not customer["consent"]:
                 return self.send_json({"error": "LGPD: este cliente não autorizou comunicações comerciais (sem consentimento/opt-in). Registre o consentimento antes de enviar."}, 400)
             content = data.get("content", "")
+            channel = data.get("channel", "WhatsApp")
+            # --- Envio REAL via integracoes, quando configuradas ---
+            if channel == "WhatsApp":
+                wa_cfg = integ.get_config(conn, cid, "whatsapp", active_only=True)
+                if integ.configured_status("whatsapp", wa_cfg)[0]:
+                    try:
+                        wamid, _raw = integ.whatsapp_send(wa_cfg, customer["phone"], content, data.get("template_name") or None)
+                        cur = conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,external_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                                           (cid, customer["id"], channel, content, "enviado via WhatsApp Cloud API", wamid, now()))
+                        ai_log(conn, cid, "message_send_real", f"WhatsApp para {customer['name']}")
+                        return self.send_json({"message": dict(conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()), "note": f"✅ Mensagem enviada de verdade via WhatsApp Cloud API para {customer['phone']} (id {wamid})."})
+                    except IntegrationError as e:
+                        detail = integ.provider_error_detail(e.detail)
+                        cur = conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
+                                           (cid, customer["id"], channel, content, f"falha no envio WhatsApp: {e} {detail}"[:240], now()))
+                        return self.send_json({"error": f"Meta/WhatsApp recusou o envio: {e} {detail}".strip(), "message": dict(conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone())}, e.status)
+                cur = conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
+                                   (cid, customer["id"], channel, content, "na fila — WhatsApp Cloud API não configurada", now()))
+                ai_log(conn, cid, "message_send", f"WhatsApp (fila) para {customer['name']}")
+                return self.send_json({"message": dict(conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()), "note": "Mensagem registrada na fila. Configure a WhatsApp Cloud API em Admin & Planos → Integrações para enviar de verdade — nunca por spam."})
+            if channel == "E-mail":
+                smtp_cfg = integ.get_config(conn, cid, "smtp", active_only=True)
+                if integ.configured_status("smtp", smtp_cfg)[0]:
+                    try:
+                        integ.smtp_send(smtp_cfg, customer["email"], data.get("subject") or f"Mensagem de {company['name']}", content)
+                        cur = conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
+                                           (cid, customer["id"], channel, content, "enviado via SMTP", now()))
+                        return self.send_json({"message": dict(conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()), "note": f"✅ E-mail enviado via SMTP para {customer['email']}."})
+                    except IntegrationError as e:
+                        return self.send_json({"error": str(e)}, e.status)
+                cur = conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
+                                   (cid, customer["id"], channel, content, "na fila — SMTP não configurado", now()))
+                return self.send_json({"message": dict(conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()), "note": "E-mail registrado na fila. Configure o SMTP em Admin & Planos → Integrações para enviar de verdade."})
             cur = conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
-                               (cid, customer["id"], data.get("channel", "WhatsApp"), content, "registrado — aguardando integração oficial WhatsApp Cloud API", now()))
-            ai_log(conn, cid, "message_send", f"{data.get('channel','WhatsApp')} para {customer['name']}")
-            return self.send_json({"message": dict(conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()), "note": "Mensagem registrada na fila. O envio real acontece pela integração oficial (WhatsApp Cloud API / provedor de e-mail) quando conectada — nunca por spam."})
+                               (cid, customer["id"], channel, content, "registrado", now()))
+            return self.send_json({"message": dict(conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()), "note": "Mensagem registrada."})
 
         if path == "/api/settings" and method == "GET":
             settings = conn.execute("SELECT * FROM store_settings WHERE company_id=?", (cid,)).fetchone()
@@ -653,14 +839,9 @@ class Handler(BaseHTTPRequestHandler):
             usage = conn.execute("SELECT COUNT(*) actions, COALESCE(SUM(tokens),0) tokens FROM ai_usage WHERE company_id=? AND strftime('%Y-%m',created_at)=strftime('%Y-%m','now')", (cid,)).fetchone()
             audit = [dict(r) for r in conn.execute("SELECT * FROM audit_logs WHERE company_id=? ORDER BY id DESC LIMIT 15", (cid,))]
             counts = {t: conn.execute(f"SELECT COUNT(*) c FROM {t} WHERE company_id=?", (cid,)).fetchone()["c"] for t in ["products", "customers", "leads", "campaigns", "orders"]}
+            integ_items = integ.list_integrations(conn, cid)
             return self.send_json({"plans": plans, "users": users, "usage": dict(usage), "audit": audit, "counts": counts,
-                                   "integrations": [
-                                       {"name": "WhatsApp Business / Cloud API", "status": "Não conectada", "desc": "Envio oficial de mensagens e atendimento. Requer número e aprovação de templates (Meta)."},
-                                       {"name": "Instagram / Facebook (Meta)", "status": "Não conectada", "desc": "Publicação e métricas via APIs oficiais quando autorizadas."},
-                                       {"name": "Google Places (prospecção)", "status": "Não conectada", "desc": "Fonte autorizada para oportunidades B2B por cidade/segmento."},
-                                       {"name": "Gateway de pagamento", "status": "Não conectado", "desc": "Pix/cartão no checkout da loja (Mercado Pago, Stripe etc.)."},
-                                       {"name": "Provedor de e-mail", "status": "Não conectado", "desc": "Envio com opt-out e métricas (SMTP/serviço transacional)."},
-                                   ]})
+                                   "integrations": [{"name": i["name"], "status": i["status"], "desc": i["desc"]} for i in integ_items]})
         if path == "/api/admin/plan" and method == "POST":
             conn.execute("UPDATE companies SET plan_id=? WHERE id=?", (int(data.get("plan_id")), cid))
             log_audit(conn, cid, user["id"], "plan_change", f"Plano alterado para {data.get('plan_id')}")
@@ -789,6 +970,118 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("INSERT INTO sessions(user_id,token_hash,created_at,expires_at) VALUES(?,?,?,?)", (user_id, token_hash, now(), expires))
         return token
 
+    # ---------- Webhooks / pagamentos (integracoes reais) ----------
+    def webhook_whatsapp(self, conn, data):
+        try:
+            for entry in (data.get("entry") or []):
+                for change in (entry.get("changes") or []):
+                    value = change.get("value") or {}
+                    metadata = value.get("metadata") or {}
+                    phone_number_id = str(metadata.get("phone_number_id") or "")
+                    company_id = None
+                    for r in conn.execute("SELECT company_id, config FROM integrations WHERE provider='whatsapp'").fetchall():
+                        try:
+                            cfg = json.loads(r["config"] or "{}")
+                        except Exception:
+                            cfg = {}
+                        if phone_number_id and str(cfg.get("phone_number_id") or "") == phone_number_id:
+                            company_id = r["company_id"]
+                            break
+                    if not company_id:
+                        continue
+                    profiles = {}
+                    for c in (value.get("contacts") or []):
+                        profiles[c.get("wa_id", "")] = (c.get("profile") or {}).get("name", "")
+                    for msg in (value.get("messages") or []):
+                        wa_id = msg.get("from", "")
+                        text = ((msg.get("text") or {}).get("body")) or f"[{msg.get('type', 'mensagem')}]"
+                        customer = None
+                        for cand in conn.execute("SELECT * FROM customers WHERE company_id=?", (company_id,)).fetchall():
+                            cand_digits = re.sub(r"\D", "", cand["phone"] or "")
+                            if cand_digits and (cand_digits.endswith(wa_id[-11:]) if len(wa_id) >= 11 else cand_digits == wa_id):
+                                customer = cand
+                                break
+                        if not customer:
+                            cur = conn.execute("INSERT INTO customers(company_id,name,phone,segment,consent,referral_code,created_at) VALUES(?,?,?,?,?,?,?)",
+                                               (company_id, profiles.get(wa_id) or wa_id, wa_id, "WhatsApp", 1, "WA" + str(random.randint(1000, 9999)), now()))
+                            customer = conn.execute("SELECT * FROM customers WHERE id=?", (cur.lastrowid,)).fetchone()
+                        conn.execute("INSERT INTO messages(company_id,customer_id,channel,direction,content,status,external_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                                     (company_id, customer["id"], "WhatsApp", "in", text, "recebido via WhatsApp Cloud API", msg.get("id", ""), now()))
+                        notify(conn, company_id, "💬 Nova mensagem no WhatsApp", f"{customer['name']}: {text[:120]}", "info")
+                    for st in (value.get("statuses") or []):
+                        if st.get("id"):
+                            conn.execute("UPDATE messages SET status=? WHERE company_id=? AND external_id=?", (f"WhatsApp: {st.get('status')}", company_id, st["id"]))
+        except Exception as e:
+            print(f"[webhook whatsapp] {e}")
+        return self.send_json({"received": True})
+
+    def apply_mp_status(self, conn, payment, mp_status, raw):
+        previous = payment["status"]
+        conn.execute("UPDATE payments SET status=?, raw=?, updated_at=? WHERE id=?", (mp_status, json.dumps(raw, ensure_ascii=False)[:8000], now(), payment["id"]))
+        if mp_status == "approved" and previous != "approved" and payment["order_id"]:
+            order = conn.execute("SELECT * FROM orders WHERE id=? AND company_id=?", (payment["order_id"], payment["company_id"])).fetchone()
+            if order:
+                conn.execute("UPDATE orders SET status='pago' WHERE id=?", (order["id"],))
+                if order["customer_id"]:
+                    conn.execute("UPDATE customers SET total_spent=COALESCE(total_spent,0)+?, purchases=COALESCE(purchases,0)+1, last_purchase=? WHERE id=?", (order["total"], today(), order["customer_id"]))
+                notify(conn, payment["company_id"], "💰 Pagamento aprovado (Mercado Pago)", f"Pedido #{order['id']} — {order['customer_name']} — {brl(order['total'])}", "success")
+
+    def webhook_mercadopago(self, conn, payment_external_id):
+        if not payment_external_id:
+            return self.send_json({"received": True})
+        payment = conn.execute("SELECT * FROM payments WHERE external_id=?", (str(payment_external_id),)).fetchone()
+        if payment:
+            config = integ.get_config(conn, payment["company_id"], "mercadopago", active_only=True)
+            try:
+                raw = integ.mp_get_payment(config, payment_external_id)
+                self.apply_mp_status(conn, payment, raw.get("status", payment["status"]), raw)
+            except Exception as e:
+                print(f"[webhook mercadopago] {e}")
+        return self.send_json({"received": True})
+
+    def payments_create(self, conn, company, user, data):
+        cid = company["id"]
+        config = integ.get_config(conn, cid, "mercadopago", active_only=True)
+        ok, missing = integ.configured_status("mercadopago", config)
+        if not ok:
+            return self.send_json({"error": f"Mercado Pago não configurado (faltam: {', '.join(missing)}). Configure em Admin & Planos → Integrações. Sem credencial, nenhum pagamento real é criado."}, 400)
+        order = None
+        amount = float(data.get("amount") or 0)
+        if data.get("order_id"):
+            order = conn.execute("SELECT * FROM orders WHERE id=? AND company_id=?", (data["order_id"], cid)).fetchone()
+            if not order:
+                return self.send_json({"error": "Pedido não encontrado"}, 404)
+            amount = float(order["total"] or 0)
+        if amount <= 0:
+            return self.send_json({"error": "Informe um valor maior que zero (ou um pedido válido)."}, 400)
+        method = data.get("method", "pix")
+        notification_url = self.base_url() + "/api/webhooks/mercadopago"
+        payer_email = data.get("payer_email") or ""
+        if order and order["customer_id"]:
+            cust = conn.execute("SELECT email FROM customers WHERE id=?", (order["customer_id"],)).fetchone()
+            payer_email = payer_email or (cust["email"] if cust else "")
+        external_ref = f"order-{order['id']}" if order else f"manual-{int(datetime.datetime.now().timestamp())}"
+        try:
+            if method == "card":
+                items = []
+                if order:
+                    items = [{"title": i["product_name"], "quantity": i["qty"], "unit_price": i["price"]} for i in conn.execute("SELECT * FROM order_items WHERE order_id=?", (order["id"],))]
+                if not items:
+                    items = [{"title": data.get("description") or "Pedido ProdutoVenda IA", "quantity": 1, "unit_price": amount}]
+                result = integ.mp_create_preference(config, items, external_ref, self.base_url(), notification_url)
+                qr, qrb64 = "", ""
+            else:
+                result = integ.mp_create_pix(config, amount, data.get("description") or (f"Pedido #{order['id']}" if order else "Pagamento ProdutoVenda IA"), payer_email, external_ref, notification_url)
+                qr, qrb64 = result.get("qr_code", ""), result.get("qr_code_base64", "")
+        except IntegrationError as e:
+            return self.send_json({"error": f"Mercado Pago recusou a criação: {e} {integ.provider_error_detail(e.detail)}".strip()}, e.status)
+        cur = conn.execute("INSERT INTO payments(company_id,order_id,provider,external_id,method,amount,status,qr_code,qr_code_base64,checkout_url,raw,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (cid, order["id"] if order else None, "mercadopago", result["external_id"], method, amount, result["status"], qr, qrb64, result.get("checkout_url", ""), json.dumps(result.get("raw", {}), ensure_ascii=False)[:8000], now(), now()))
+        log_audit(conn, cid, user["id"], "payment_create", f"{method} {amount} ext={result['external_id']}")
+        payment = dict(conn.execute("SELECT * FROM payments WHERE id=?", (cur.lastrowid,)).fetchone())
+        payment.pop("raw", None)
+        return self.send_json({"payment": payment, "message": "✅ Pix gerado no Mercado Pago! Envie o QR Code/copia e cola ao cliente." if method != "card" else "✅ Link de pagamento (Checkout Pro) gerado! Envie o link ao cliente."}, 201)
+
     def public_checkout(self, conn, company, data):
         cid = company["id"]
         items = data.get("items") or []
@@ -826,8 +1119,12 @@ class Handler(BaseHTTPRequestHandler):
             customer = conn.execute("SELECT * FROM customers WHERE id=?", (cur.lastrowid,)).fetchone()
             conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
                          (cid, customer["id"], "WhatsApp", f"Oi, {name.split()[0]}! 😊 Bem-vindo(a)! Use BEMVINDO10 na próxima compra.", "registrado (boas-vindas automática)", now()))
+        payment_method = (data.get("payment_method") or "manual").lower()
+        mp_cfg = integ.get_config(conn, cid, "mercadopago", active_only=True)
+        use_gateway = payment_method in ("pix", "card") and integ.configured_status("mercadopago", mp_cfg)[0]
+        order_status = "aguardando pagamento" if use_gateway else "pago"
         cur = conn.execute("INSERT INTO orders(company_id,customer_id,customer_name,total,profit,status,channel,coupon,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                           (cid, customer["id"], name, total, round(profit, 2), "pago", "Loja", (coupon_row["code"] if coupon_row else ""), now()))
+                           (cid, customer["id"], name, total, round(profit, 2), order_status, "Loja", (coupon_row["code"] if coupon_row else ""), now()))
         order_id = cur.lastrowid
         for product, qty in lines:
             conn.execute("INSERT INTO order_items(company_id,order_id,product_id,product_name,qty,price) VALUES(?,?,?,?,?,?)", (cid, order_id, product["id"], product["name"], qty, product["price"]))
@@ -835,9 +1132,32 @@ class Handler(BaseHTTPRequestHandler):
         if coupon_row:
             conn.execute("UPDATE coupons SET used=used+1 WHERE id=?", (coupon_row["id"],))
             conn.execute("INSERT INTO coupon_usages(company_id,coupon_id,customer_id,order_id,created_at) VALUES(?,?,?,?,?)", (cid, coupon_row["id"], customer["id"], order_id, now()))
-        conn.execute("UPDATE customers SET total_spent=COALESCE(total_spent,0)+?, purchases=COALESCE(purchases,0)+1, last_purchase=? WHERE id=?", (total, today(), customer["id"]))
+        if order_status == "pago":
+            conn.execute("UPDATE customers SET total_spent=COALESCE(total_spent,0)+?, purchases=COALESCE(purchases,0)+1, last_purchase=? WHERE id=?", (total, today(), customer["id"]))
+        # --- Pagamento real via Mercado Pago (Pix QR / Checkout Pro cartao) ---
+        payment_info = None
+        if use_gateway:
+            notification_url = self.base_url() + "/api/webhooks/mercadopago"
+            try:
+                if payment_method == "card":
+                    result = integ.mp_create_preference(mp_cfg, [{"title": p["name"], "quantity": q, "unit_price": p["price"]} for p, q in lines], f"order-{order_id}", self.base_url(), notification_url)
+                    qr, qrb64 = "", ""
+                else:
+                    result = integ.mp_create_pix(mp_cfg, total, f"Pedido #{order_id} — {company['name']}", data.get("email") or customer["email"], f"order-{order_id}", notification_url)
+                    qr, qrb64 = result.get("qr_code", ""), result.get("qr_code_base64", "")
+                cur = conn.execute("INSERT INTO payments(company_id,order_id,provider,external_id,method,amount,status,qr_code,qr_code_base64,checkout_url,raw,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                   (cid, order_id, "mercadopago", result["external_id"], payment_method, total, result["status"], qr, qrb64, result.get("checkout_url", ""), json.dumps(result.get("raw", {}), ensure_ascii=False)[:8000], now(), now()))
+                payment_info = {"id": cur.lastrowid, "method": payment_method, "status": result["status"], "qr_code": qr, "qr_code_base64": qrb64, "checkout_url": result.get("checkout_url", "")}
+            except IntegrationError as e:
+                payment_info = {"method": payment_method, "status": "erro", "error": f"{e} {integ.provider_error_detail(e.detail)}".strip()}
         conn.commit()
-        return self.send_json({"ok": True, "order_id": order_id, "total": total, "discount": round(discount, 2), "message": "Pedido confirmado! 🎉 Obrigado pela compra. Você receberá as atualizações pelo WhatsApp."})
+        if use_gateway and payment_info and payment_info.get("status") != "erro":
+            msg = "Pedido criado! ✅ Conclua o pagamento Pix para confirmar." if payment_method == "pix" else "Pedido criado! ✅ Conclua o pagamento no link do Mercado Pago para confirmar."
+        elif use_gateway:
+            msg = "Pedido registrado, mas o gateway falhou ao gerar a cobrança. A loja entrará em contato para concluir o pagamento."
+        else:
+            msg = "Pedido confirmado! 🎉 Obrigado pela compra. Você receberá as atualizações pelo WhatsApp."
+        return self.send_json({"ok": True, "order_id": order_id, "total": total, "discount": round(discount, 2), "order_status": order_status, "payment": payment_info, "message": msg})
 
     # ---------- dashboard / insights / reports / automations
     def dashboard(self, conn, company):
