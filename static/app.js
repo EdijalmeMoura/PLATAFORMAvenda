@@ -35,6 +35,10 @@ function formModal(title, fields, submitLabel, onSubmit) {
   };
 }
 function badge(text, cls = "b-gray") { return `<span class="badge ${cls}">${esc(text)}</span>`; }
+function thumbHtml(p, size = 52) {
+  if (p.image) return `<img src="${esc(p.image)}" alt="${esc(p.name)}" style="width:${size}px;height:${size}px;border-radius:14px;object-fit:cover;flex:none;border:1px solid var(--line)">`;
+  return `<span class="prod-thumb" style="width:${size}px;height:${size}px;font-size:${Math.round(size * 0.52)}px">${esc(p.icon || "🎁")}</span>`;
+}
 function statusBadge(s) { const map = { pago: "b-green", ativa: "b-green", ativo: "b-green", enviada: "b-violet", Proposta: "b-violet", Interessado: "b-violet", "Novo Lead": "b-amber", pendente: "b-amber", agendado: "b-amber", abandonado: "b-red", Perdido: "b-red", entregue: "b-green", "No CRM": "b-green" }; return badge(s || "-", map[s] || "b-gray"); }
 async function copyText(text, msg = "Copiado!") { try { await navigator.clipboard.writeText(text); toast(msg, "ok"); } catch { toast("Copie manualmente: " + text); } }
 
@@ -256,10 +260,10 @@ async function viewAgente() {
 async function viewProdutos() {
   const { products } = await api("/api/products");
   shell(`<div class="row between mb"><div><p class="mut" style="margin:0">Cadastre um produto e a IA cria descrição comercial, página, campanhas, cupons e mensagens. Funciona para qualquer segmento — é o <b>Modo Produto</b>.</p></div><button class="btn" onclick="App.productForm()">+ Novo produto</button></div>
-  ${products.length ? `<div class="grid g2">${products.map(p => { const margin = p.price ? Math.round((p.price - (p.cost || 0)) / p.price * 100) : 0; return `<div class="card"><div class="row"><span class="prod-thumb">${esc(p.icon || "🎁")}</span><div style="flex:1"><b>${esc(p.name)}</b><br><span class="small mut">${esc(p.audience || "")}</span></div>${(p.stock || 0) <= 20 ? badge("Estoque baixo: " + p.stock, "b-red") : badge("Estoque: " + p.stock, "b-green")}</div>
+  ${products.length ? `<div class="grid g2">${products.map(p => { const margin = p.price ? Math.round((p.price - (p.cost || 0)) / p.price * 100) : 0; return `<div class="card"><div class="row">${thumbHtml(p)}<div style="flex:1"><b>${esc(p.name)}</b><br><span class="small mut">${esc(p.audience || "")}</span></div>${(p.stock || 0) <= 20 ? badge("Estoque baixo: " + p.stock, "b-red") : badge("Estoque: " + p.stock, "b-green")}</div>
     <p class="small mut mt" style="min-height:36px">${esc((p.description || "").slice(0, 130))}…</p>
     <div class="row small"><span>💰 <b>${money(p.price)}</b></span><span>Custo ${money(p.cost)}</span><span>Margem ${margin}%</span><span>🏆 ${p.sales || 0} vendas</span>${p.ai_page ? badge("Página IA ✓", "b-violet") : ""}</div>
-    <div class="row mt"><button class="btn sm" onclick="App.generatePage(${p.id})">✨ GERAR PÁGINA COM IA</button><button class="btn sm soft" onclick="App.campaignFor(${p.id})">📣 Campanha</button><button class="btn sm ghost" onclick="App.productForm(${p.id})">Editar</button><button class="btn sm ghost" onclick="App.del('/api/products/${p.id}','Produto removido')">🗑️</button></div></div>`; }).join("")}</div>` : `<div class="empty">📦 Nenhum produto ainda.<br><br><button class="btn" onclick="App.productForm()">Cadastrar primeiro produto</button></div>`}`, "Produtos — Modo Produto");
+    <div class="row mt"><button class="btn sm" onclick="App.generatePage(${p.id})">✨ GERAR PÁGINA COM IA</button><button class="btn sm soft" onclick="App.productImage(${p.id})">📷 ${p.image ? "Trocar foto" : "Enviar foto"}</button><button class="btn sm soft" onclick="App.campaignFor(${p.id})">📣 Campanha</button><button class="btn sm ghost" onclick="App.productForm(${p.id})">Editar</button><button class="btn sm ghost" onclick="App.del('/api/products/${p.id}','Produto removido')">🗑️</button></div></div>`; }).join("")}</div>` : `<div class="empty">📦 Nenhum produto ainda.<br><br><button class="btn" onclick="App.productForm()">Cadastrar primeiro produto</button></div>`}`, "Produtos — Modo Produto");
   state._products = products;
 }
 async function viewLoja() {
@@ -294,7 +298,7 @@ async function renderPublicStore(slug) {
     $("#app").innerHTML = `<div style="max-width:1150px;margin:0 auto;padding:22px">
     <div class="row between"><b style="font-size:19px">${esc(s.logo || "🛍️")} ${esc(s.store_name || data.company.name)}</b><span class="row"><button class="btn ghost sm" onclick="location.hash='#/dashboard'">← Painel</button><button class="btn sm" style="background:${color}" onclick="document.getElementById('cart-section').scrollIntoView({behavior:'smooth'})">🛒 Carrinho (${state.cart.reduce((a, c) => a + c.qty, 0)}) · ${money(cartTotal)}</button></span></div>
     <div class="store-hero mt" style="--sc:${color};background:linear-gradient(135deg,${color},#db2777)"><span class="chip" style="background:rgba(255,255,255,.18);color:#fff;border:none">${esc(data.company.segment || "")} · ${esc(data.company.city || "")}</span><h1 style="margin:12px 0 6px;font-size:32px">${esc(s.banner || s.store_name || data.company.name)}</h1><p style="opacity:.92;max-width:620px">${esc(s.description || "")}</p><p class="small" style="opacity:.85">💬 Pedidos e dúvidas também pelo WhatsApp ${esc(data.company.whatsapp || "")} ${s.instagram ? "· Instagram " + esc(s.instagram) : ""}</p></div>
-    <h3 class="mt">🛍️ Produtos</h3><div class="store-grid">${data.products.map(p => { let page = {}; try { page = JSON.parse(p.page_data || "{}"); } catch {} return `<div class="store-card"><div style="height:130px;background:linear-gradient(135deg,#ede9fe,#fce7f3);display:flex;align-items:center;justify-content:center;font-size:58px">${esc(p.icon || "🎁")}</div><div class="body"><b>${esc(p.name)}</b><p class="small mut" style="min-height:34px">${esc(page.subtitle || (p.description || "").slice(0, 80))}</p><div class="row between"><b style="font-size:17px">${money(p.price)}</b><span class="small mut">${(p.stock || 0) > 0 ? p.stock + " em estoque" : "Sob encomenda"}</span></div>
+    <h3 class="mt">🛍️ Produtos</h3><div class="store-grid">${data.products.map(p => { let page = {}; try { page = JSON.parse(p.page_data || "{}"); } catch {} return `<div class="store-card">${p.image ? `<img src="${esc(p.image)}" alt="${esc(p.name)}" style="width:100%;height:150px;object-fit:cover;display:block">` : `<div style="height:130px;background:linear-gradient(135deg,#ede9fe,#fce7f3);display:flex;align-items:center;justify-content:center;font-size:58px">${esc(p.icon || "🎁")}</div>`}<div class="body"><b>${esc(p.name)}</b><p class="small mut" style="min-height:34px">${esc(page.subtitle || (p.description || "").slice(0, 80))}</p><div class="row between"><b style="font-size:17px">${money(p.price)}</b><span class="small mut">${(p.stock || 0) > 0 ? p.stock + " em estoque" : "Sob encomenda"}</span></div>
     ${page.benefits ? `<p class="small" style="margin:8px 0">✨ ${esc(page.benefits[0])}<br>🎁 ${esc(page.benefits[2] || "")}</p>` : ""}
     ${page.faq ? `<details class="small mut"><summary style="cursor:pointer;font-weight:700">Perguntas frequentes</summary>${page.faq.map(f => `<p><b>${esc(f.q)}</b><br>${esc(f.a)}</p>`).join("")}</details>` : ""}
     <button class="btn block mt" style="background:${color}" onclick="App.addCart(${p.id})">Adicionar ao carrinho 🛒</button></div></div>`; }).join("")}</div>
@@ -493,7 +497,11 @@ async function viewEmail() {
 async function viewRelatorios() {
   const r = await api("/api/reports");
   const max = Math.max(...r.monthly.map(m => m.revenue), 1);
-  shell(`<div class="grid g3"><div class="card kpi"><div class="lbl">Receita total</div><div class="val">${money(r.totals.revenue)}</div></div><div class="card kpi"><div class="lbl">Lucro total estimado</div><div class="val">${money(r.totals.profit)}</div></div><div class="card kpi"><div class="lbl">Pedidos</div><div class="val">${r.totals.orders}</div></div></div>
+  shell(`<div class="row between mb"><p class="mut" style="margin:0">Exporte para planilha ou gere o PDF do relatório.</p><span class="row">
+  <button class="btn sm soft" onclick="App.downloadCsv('orders')">📊 CSV Pedidos</button><button class="btn sm soft" onclick="App.downloadCsv('products')">📊 CSV Produtos</button>
+  <button class="btn sm soft" onclick="App.downloadCsv('customers')">📊 CSV Clientes</button><button class="btn sm soft" onclick="App.downloadCsv('payments')">📊 CSV Pagamentos</button>
+  <button class="btn sm" onclick="window.print()">🖨️ Imprimir / Salvar PDF</button></span></div>
+  <div class="grid g3"><div class="card kpi"><div class="lbl">Receita total</div><div class="val">${money(r.totals.revenue)}</div></div><div class="card kpi"><div class="lbl">Lucro total estimado</div><div class="val">${money(r.totals.profit)}</div></div><div class="card kpi"><div class="lbl">Pedidos</div><div class="val">${r.totals.orders}</div></div></div>
   <div class="card mt"><h3>📈 Receita por mês</h3>${r.monthly.map(m => `<div class="row" style="gap:12px;margin:8px 0"><span class="small" style="width:64px">${esc(m.label)}</span><div class="progress" style="flex:1"><div style="width:${Math.round(m.revenue / max * 100)}%"></div></div><b class="small">${money(m.revenue)}</b><span class="small mut">${m.orders} ped. · lucro ${money(m.profit)}</span></div>`).join("")}</div>
   <div class="grid g2 mt"><div class="card"><h3>🏆 Produtos (receita)</h3><table><tr><th>Produto</th><th>Qtd</th><th>Receita</th></tr>${r.by_product.map(p => `<tr><td>${esc(p.name)}</td><td>${p.qty}</td><td><b>${money(p.revenue)}</b></td></tr>`).join("")}</table></div>
   <div class="card"><h3>🔀 Canais de venda</h3><table><tr><th>Canal</th><th>Pedidos</th><th>Receita</th></tr>${r.by_channel.map(c => `<tr><td>${esc(c.channel)}</td><td>${c.orders}</td><td><b>${money(c.revenue)}</b></td></tr>`).join("")}</table>
@@ -516,10 +524,12 @@ async function viewMetas() {
 async function viewAdmin() {
   const a = await api("/api/admin");
   const ig = await api("/api/integrations").catch(() => ({ integrations: [] }));
+  const billing = await api("/api/billing").catch(() => ({}));
   state._integrations = ig.integrations || [];
   shell(`<div class="card mb"><h3>🛡️ Administração da plataforma</h3><p class="mut">Usuários, planos, assinaturas, uso de IA, integrações, logs e métricas. Cada empresa (tenant) só enxerga os próprios dados.</p>
   <div class="row mt">${Object.entries(a.counts).map(([k, v]) => badge(k + ": " + v, "b-violet")).join("")} ${badge("Ações de IA no mês: " + a.usage.actions, "b-green")} ${badge("Tokens estimados: " + a.usage.tokens, "b-gray")} ${badge("Sistema: v" + (a.version || "1.2.0") + " · /api/health", "b-green")}</div>
-  <div class="row mt"><button class="btn sm soft" onclick="App.exportData()">📦 Exportar dados da empresa (JSON)</button><span class="small mut">Backup portátil dos seus dados — nunca inclui senhas nem segredos de integração.</span></div></div>
+  <div class="row mt"><button class="btn sm soft" onclick="App.exportData()">📦 Exportar dados da empresa (JSON)</button><span class="small mut">Backup portátil dos seus dados — nunca inclui senhas nem segredos de integração.</span></div>
+  ${billing.subscription ? `<p class="small mt">💎 Assinatura: <b>${esc(billing.subscription.plan_name || "")}</b> · status <b>${esc(billing.subscription.status)}</b>${billing.subscription.current_period_end ? ` · vigente até <b>${esc(billing.subscription.current_period_end)}</b>` : ""} · ${money(billing.subscription.amount)}/mês</p>` : `<p class="small mut mt">💎 Nenhuma assinatura registrada — escolha um plano abaixo (pagos são cobrados via Mercado Pago e ativados no webhook).</p>`}</div>
   <div class="card mb"><h3>🔌 Integrações reais</h3><p class="mut">Conecte suas credenciais oficiais — elas ficam salvas <b>apenas no servidor da sua empresa</b>, sempre mascaradas na tela, e nada é simulado: o botão <b>Testar conexão</b> faz uma chamada real à API. Guia passo a passo no arquivo <b>INTEGRACOES.md</b> do projeto.</p>
   <div class="grid g2 mt">${state._integrations.map(it => `<div style="border:1px solid var(--line);border-radius:14px;padding:15px">
     <div class="row between"><b>${esc(it.icon)} ${esc(it.name)}</b>${it.connected ? badge("● Conectada e ativa", "b-green") : it.configured ? badge("Configurada (desativada)", "b-amber") : badge("Não configurada", "b-gray")}</div>
@@ -529,7 +539,7 @@ async function viewAdmin() {
     ${it.webhook_url ? `<p class="small mut">Webhook (cole no provedor):<br><a href="#" onclick="event.preventDefault();App.copyText('${esc(it.webhook_url)}','URL do webhook copiada!')">${esc(it.webhook_url)}</a> 📋</p>` : ""}
     <div class="row mt"><button class="btn sm" onclick="App.integrationForm('${it.provider}')">⚙️ Configurar</button><button class="btn sm soft" onclick="App.testIntegration('${it.provider}')" ${it.configured ? "" : "disabled"}>🔌 Testar conexão</button>
     ${it.configured ? `<button class="btn sm ghost" onclick="App.toggleIntegration('${it.provider}',${it.active ? 0 : 1})">${it.active ? "Desativar" : "Ativar"}</button>` : ""}</div></div>`).join("")}</div></div>
-  <h3 class="mb">💎 Planos (limites configuráveis)</h3><div class="grid g4">${a.plans.map(p => { const lim = JSON.parse(p.limits || "{}"); const current = state.me.company.plan_id === p.id; return `<div class="card" style="${current ? "border:2px solid var(--brand)" : ""}"><b>${esc(p.name)}</b>${current ? ' ' + badge("PLANO ATUAL", "b-violet") : ""}<div class="val" style="font-size:24px;font-weight:850;margin:8px 0">${p.price ? money(p.price) + "<span class='small mut'>/mês</span>" : "Grátis"}</div><p class="small mut" style="line-height:1.8">${Object.entries(lim).map(([k, v]) => `${k}: <b>${v >= 9999 ? "ilimitado" : v}</b>`).join("<br>")}</p>${current ? "" : `<button class="btn sm block mt" onclick="App.changePlan(${p.id})">Assinar/alterar</button>`}</div>`; }).join("")}</div>
+  <h3 class="mb">💎 Planos (limites configuráveis)</h3><div class="grid g4">${a.plans.map(p => { const lim = JSON.parse(p.limits || "{}"); const current = state.me.company.plan_id === p.id; return `<div class="card" style="${current ? "border:2px solid var(--brand)" : ""}"><b>${esc(p.name)}</b>${current ? ' ' + badge("PLANO ATUAL", "b-violet") : ""}<div class="val" style="font-size:24px;font-weight:850;margin:8px 0">${p.price ? money(p.price) + "<span class='small mut'>/mês</span>" : "Grátis"}</div><p class="small mut" style="line-height:1.8">${Object.entries(lim).map(([k, v]) => `${k}: <b>${v >= 9999 ? "ilimitado" : v}</b>`).join("<br>")}</p>${current ? "" : `<button class="btn sm block mt" onclick="App.subscribePlan(${p.id},'${esc(p.name)}',${p.price})">${p.price ? "Assinar " + money(p.price) + "/mês" : "Ativar plano grátis"}</button>`}</div>`; }).join("")}</div>
   <div class="grid g2 mt"><div class="card"><h3>👥 Usuários da empresa</h3>${a.users.map(u => `<div class="row between" style="padding:8px 0;border-bottom:1px solid var(--line)"><span><b>${esc(u.name)}</b><br><span class="small mut">${esc(u.email)}</span></span>${badge(u.role, "b-violet")}</div>`).join("")}</div>
   <div class="card"><h3>🔌 Integrações (APIs oficiais)</h3>${a.integrations.map(i => `<div style="padding:9px 0;border-bottom:1px solid var(--line)"><div class="row between"><b class="small">${esc(i.name)}</b>${badge(i.status, "b-amber")}</div><p class="small mut" style="margin:3px 0">${esc(i.desc)}</p></div>`).join("")}</div></div>
   <div class="card mt"><h3>📜 Logs de auditoria</h3><table><tr><th>Data</th><th>Ação</th><th>Detalhe</th></tr>${a.audit.map(l => `<tr><td class="small">${esc((l.created_at || "").slice(0, 16).replace("T", " "))}</td><td>${esc(l.action)}</td><td class="small mut">${esc((l.detail || "").slice(0, 120))}</td></tr>`).join("")}</table></div>`, "Admin & Planos");
@@ -852,6 +862,64 @@ const App = {
     catch (e) { toast(e.message, "err"); }
   },
   async changePlan(id) { try { await api("/api/admin/plan", "POST", { plan_id: id }); state.me = await api("/api/auth/me"); toast("Plano atualizado! 💎", "ok"); viewAdmin(); } catch (e) { toast(e.message, "err"); } },
+  productImage(id) {
+    const p = (state._products || []).find(x => x.id === id) || {};
+    state._imgData = "";
+    openModal(`<div class="row between"><h3 style="margin:0">📷 Foto de ${esc(p.name || "produto")}</h3><button class="icon-btn" onclick="App.closeModal()">✕</button></div>
+    ${p.image ? `<img src="${esc(p.image)}" style="width:100%;max-height:240px;object-fit:cover;border-radius:14px;margin-top:12px">` : `<div class="empty mt">Sem foto — o produto usa o ícone ${esc(p.icon || "🎁")} na loja.</div>`}
+    <label class="f">Enviar nova foto (PNG, JPG ou WEBP, até 2 MB)</label>
+    <input type="file" id="img-file" accept="image/png,image/jpeg,image/webp">
+    <img id="img-preview" style="display:none;width:100%;max-height:240px;object-fit:cover;border-radius:14px;margin-top:12px">
+    <div class="row mt"><button class="btn" onclick="App.uploadProductImage(${id})">Salvar foto</button>
+    ${p.image ? `<button class="btn ghost" onclick="App.removeProductImage(${id})">Remover foto</button>` : ""}</div>
+    <p class="small mut">A foto aparece no painel, na vitrine da loja e na página do produto.</p>`);
+    $("#img-file").onchange = (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      if (file.size > 2_000_000) return toast("Imagem maior que 2 MB. Reduza e tente de novo.", "err");
+      const reader = new FileReader();
+      reader.onload = () => { state._imgData = reader.result; const img = $("#img-preview"); img.src = reader.result; img.style.display = "block"; };
+      reader.readAsDataURL(file);
+    };
+  },
+  async uploadProductImage(id) {
+    if (!state._imgData) return toast("Escolha uma foto primeiro 📷", "err");
+    try { const r = await api(`/api/products/${id}/image`, "POST", { image_data: state._imgData }); toast(r.message, "ok"); closeModal(); viewProdutos(); }
+    catch (e) { toast(e.message, "err"); }
+  },
+  async removeProductImage(id) {
+    try { const r = await api(`/api/products/${id}/image`, "DELETE"); toast(r.message, "ok"); closeModal(); viewProdutos(); }
+    catch (e) { toast(e.message, "err"); }
+  },
+  subscribePlan(id, name, price) {
+    if (!price) {
+      api("/api/billing/subscribe", "POST", { plan_id: id }).then(async (r) => { state.me = await api("/api/auth/me"); toast(r.message, "ok"); viewAdmin(); }).catch(e => toast(e.message, "err"));
+      return;
+    }
+    openModal(`<div class="row between"><h3 style="margin:0">💎 Assinar plano ${esc(name)} — ${money(price)}/mês</h3><button class="icon-btn" onclick="App.closeModal()">✕</button></div>
+    <p class="mut">A cobrança é gerada no Mercado Pago conectado. O plano é ativado automaticamente por 30 dias quando o pagamento for aprovado (webhook).</p>
+    <div class="grid g2 mt"><button class="btn" onclick="App.createSubscription(${id},'pix')">📱 Pagar com Pix</button><button class="btn soft" onclick="App.createSubscription(${id},'card')">💳 Pagar com cartão</button></div>
+    <div id="sub-result" class="mt"></div>`);
+  },
+  async createSubscription(planId, method) {
+    const box = $("#sub-result"); if (box) box.innerHTML = "Gerando cobrança da assinatura no Mercado Pago…";
+    try {
+      const r = await api("/api/billing/subscribe", "POST", { plan_id: planId, method });
+      const p = r.payment; state._lastPayment = p;
+      const html = method === "pix"
+        ? `${p.qr_code_base64 ? `<img src="data:image/png;base64,${p.qr_code_base64}" alt="QR Code Pix" style="width:210px;height:210px;border-radius:14px;border:1px solid var(--line)">` : ""}<p class="small"><b>Pix copia e cola:</b></p><textarea readonly onclick="this.select()">${esc(p.qr_code || "")}</textarea><button class="btn sm mt" onclick="App.copyText(state._lastPayment.qr_code,'Pix copiado!')">📋 Copiar Pix</button>`
+        : `<p>Link seguro do Mercado Pago:</p><p><a href="${esc(p.checkout_url)}" target="_blank" rel="noopener">${esc(p.checkout_url)}</a></p><button class="btn sm" onclick="App.copyText(state._lastPayment.checkout_url,'Link copiado!')">📋 Copiar link</button>`;
+      if (box) box.innerHTML = `<div class="card" style="background:var(--panel2);text-align:center"><b>✅ Cobrança gerada!</b><p class="small mut">${esc(r.message)}</p>${html}</div>`;
+    } catch (e) { if (box) box.innerHTML = `<div class="card" style="background:var(--panel2)">❌ ${esc(e.message)}</div>`; toast(e.message, "err"); }
+  },
+  async downloadCsv(type) {
+    try {
+      const res = await fetch("/api/reports/export.csv?type=" + type, { headers: { Authorization: "Bearer " + state.token } });
+      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || "Erro ao exportar"); }
+      const blob = await res.blob();
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `relatorio-${type}.csv`; a.click();
+      URL.revokeObjectURL(a.href); toast("CSV baixado! 📊 Abra no Excel/Sheets.", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  },
 };
 window.App = App;
 boot();

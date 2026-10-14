@@ -5,7 +5,7 @@ COPY server.py integrations.py ./
 COPY static ./static
 
 # Banco e chave-mestra fora do codigo, em volume persistente
-ENV PORT=8000 PV_DB_PATH=/app/data/plataformavenda.db
+ENV PORT=8000 PV_DB_PATH=/app/data/plataformavenda.db PV_UPLOAD_DIR=/app/data/uploads
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 

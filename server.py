@@ -4,16 +4,17 @@ ProdutoVenda IA — Central de Vendas Autônomas com IA
 Backend monolitico (Python stdlib apenas): HTTP + SQLite + autenticacao + multi-tenant + motor de IA local.
 Nenhuma dependencia externa. Dados persistentes em plataformavenda.db
 """
-import json, os, re, sqlite3, hashlib, secrets, random, datetime, urllib.parse
+import base64, csv, io, json, os, re, sqlite3, hashlib, secrets, random, datetime, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import integrations as integ
 from integrations import IntegrationError
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("PV_DB_PATH") or os.path.join(BASE, "plataformavenda.db")
+UPLOAD_DIR = os.environ.get("PV_UPLOAD_DIR") or os.path.join(BASE, "uploads")
 STATIC = os.path.join(BASE, "static")
 PORT = int(os.environ.get("PORT", "8000"))
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------- DB
 def db():
@@ -79,6 +80,8 @@ CREATE TABLE IF NOT EXISTS integrations(id INTEGER PRIMARY KEY AUTOINCREMENT, co
 CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, order_id INTEGER, provider TEXT DEFAULT 'mercadopago', external_id TEXT DEFAULT '',
   method TEXT DEFAULT 'pix', amount REAL DEFAULT 0, status TEXT DEFAULT 'pending', qr_code TEXT DEFAULT '', qr_code_base64 TEXT DEFAULT '', checkout_url TEXT DEFAULT '',
   raw TEXT DEFAULT '', created_at TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS subscriptions(id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, plan_id INTEGER, provider TEXT DEFAULT 'mercadopago',
+  external_reference TEXT DEFAULT '', status TEXT DEFAULT 'pendente', amount REAL DEFAULT 0, current_period_end TEXT, created_at TEXT, updated_at TEXT);
 """
 
 def now():
@@ -379,6 +382,12 @@ def init_db():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)")]
     if "external_id" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN external_id TEXT DEFAULT ''")
+    pcols = [r[1] for r in conn.execute("PRAGMA table_info(payments)")]
+    if "external_reference" not in pcols:
+        conn.execute("ALTER TABLE payments ADD COLUMN external_reference TEXT DEFAULT ''")
+    prcols = [r[1] for r in conn.execute("PRAGMA table_info(products)")]
+    if "image" not in prcols:
+        conn.execute("ALTER TABLE products ADD COLUMN image TEXT DEFAULT ''")
     conn.commit()
     seed(conn)
     conn.close()
@@ -405,6 +414,16 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_download(self, filename, content, content_type="text/csv; charset=utf-8"):
+        body = content.encode("utf-8") if isinstance(content, str) else content
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(body)))
         self._security_headers()
         self.end_headers()
@@ -479,6 +498,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "not found"}, 404)
 
     def serve_static(self, path):
+        if path.startswith("/uploads/"):
+            file_path = os.path.normpath(os.path.join(UPLOAD_DIR, path[len("/uploads/"):]))
+            if not file_path.startswith(os.path.normpath(UPLOAD_DIR)) or not os.path.isfile(file_path):
+                return self.send_json({"error": "Arquivo não encontrado"}, 404)
+            ext = os.path.splitext(file_path)[1].lower()
+            ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(ext, "application/octet-stream")
+            with open(file_path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/" or path == "":
             path = "/index.html"
         file_path = os.path.normpath(os.path.join(STATIC, path.lstrip("/")))
@@ -804,6 +839,49 @@ class Handler(BaseHTTPRequestHandler):
             ai_log(conn, cid, "generate_page", product["name"])
             return self.send_json({"page": page, "product": dict(product)})
 
+        m = re.match(r"^/api/products/(\d+)/image$", path)
+        if m and method == "POST":
+            product = conn.execute("SELECT * FROM products WHERE id=? AND company_id=?", (m.group(1), cid)).fetchone()
+            if not product:
+                return self.send_json({"error": "Produto não encontrado"}, 404)
+            data_url = data.get("image_data") or ""
+            match = re.match(r"^data:image/(png|jpeg|jpg|webp);base64,(.+)$", data_url, re.DOTALL)
+            if not match:
+                return self.send_json({"error": "Envie uma imagem PNG, JPG ou WEBP (campo image_data em base64)."}, 400)
+            try:
+                raw = base64.b64decode(match.group(2), validate=True)
+            except Exception:
+                return self.send_json({"error": "Imagem inválida (base64 corrompido)."}, 400)
+            if len(raw) > 2_000_000:
+                return self.send_json({"error": "Imagem muito grande: máximo 2 MB. Reduza a foto e tente de novo."}, 400)
+            if len(raw) < 20:
+                return self.send_json({"error": "Imagem inválida (arquivo muito pequeno)."}, 400)
+            ext = "png" if match.group(1) == "png" else ("webp" if match.group(1) == "webp" else "jpg")
+            folder = os.path.join(UPLOAD_DIR, str(cid))
+            os.makedirs(folder, exist_ok=True)
+            filename = f"product-{product['id']}-{secrets.token_hex(6)}.{ext}"
+            with open(os.path.join(folder, filename), "wb") as f:
+                f.write(raw)
+            old = product["image"] or ""
+            if old.startswith("/uploads/"):
+                old_path = os.path.normpath(os.path.join(UPLOAD_DIR, old[len("/uploads/"):]))
+                if old_path.startswith(os.path.normpath(UPLOAD_DIR)) and os.path.isfile(old_path):
+                    try:
+                        os.unlink(old_path)
+                    except Exception:
+                        pass
+            image_url = f"/uploads/{cid}/{filename}"
+            conn.execute("UPDATE products SET image=? WHERE id=?", (image_url, product["id"]))
+            log_audit(conn, cid, user["id"], "product_image", product["name"])
+            return self.send_json({"ok": True, "image": image_url, "message": "Foto do produto atualizada! 📷 Ela já aparece no painel e na loja."})
+        m = re.match(r"^/api/products/(\d+)/image$", path)
+        if m and method == "DELETE":
+            product = conn.execute("SELECT * FROM products WHERE id=? AND company_id=?", (m.group(1), cid)).fetchone()
+            if not product:
+                return self.send_json({"error": "Produto não encontrado"}, 404)
+            conn.execute("UPDATE products SET image='' WHERE id=?", (product["id"],))
+            return self.send_json({"ok": True, "message": "Foto removida. O produto volta a usar o ícone."})
+
         if path == "/api/coupons/suggest" and method == "POST":
             segment = (company["segment"] or "").lower()
             suggestions = [
@@ -965,6 +1043,74 @@ class Handler(BaseHTTPRequestHandler):
             integ_items = integ.list_integrations(conn, cid)
             return self.send_json({"plans": plans, "users": users, "usage": dict(usage), "audit": audit, "counts": counts, "version": APP_VERSION,
                                    "integrations": [{"name": i["name"], "status": i["status"], "desc": i["desc"]} for i in integ_items]})
+        if path == "/api/billing" and method == "GET":
+            sub = conn.execute("SELECT s.*, p.name plan_name FROM subscriptions s LEFT JOIN plans p ON p.id=s.plan_id WHERE s.company_id=? ORDER BY s.id DESC LIMIT 1", (cid,)).fetchone()
+            plan = conn.execute("SELECT * FROM plans WHERE id=?", (company["plan_id"],)).fetchone()
+            history = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE company_id=? AND external_reference LIKE 'sub-%' ORDER BY id DESC LIMIT 10", (cid,))]
+            for h in history:
+                h.pop("raw", None)
+                h.pop("qr_code_base64", None)
+            return self.send_json({"plan": dict(plan) if plan else None, "subscription": dict(sub) if sub else None, "history": history})
+        if path == "/api/billing/subscribe" and method == "POST":
+            plan = conn.execute("SELECT * FROM plans WHERE id=?", (data.get("plan_id"),)).fetchone()
+            if not plan:
+                return self.send_json({"error": "Plano não encontrado"}, 404)
+            if float(plan["price"] or 0) <= 0:
+                period_end = (datetime.date.today() + datetime.timedelta(days=36500)).isoformat()
+                conn.execute("INSERT INTO subscriptions(company_id,plan_id,provider,external_reference,status,amount,current_period_end,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                             (cid, plan["id"], "interno", f"sub-{cid}-{plan['id']}-free", "ativa", 0, period_end, now(), now()))
+                conn.execute("UPDATE companies SET plan_id=? WHERE id=?", (plan["id"], cid))
+                log_audit(conn, cid, user["id"], "billing_subscribe_free", plan["name"])
+                return self.send_json({"ok": True, "active": True, "message": f"Plano {plan['name']} ativado! 🎉 (sem cobrança)"})
+            config = integ.get_config(conn, cid, "mercadopago", active_only=True)
+            if not integ.configured_status("mercadopago", config)[0]:
+                return self.send_json({"error": "Para cobrar a assinatura, a empresa precisa conectar o Mercado Pago em Admin → Integrações (em produção, o billing usa a conta da plataforma). Sem gateway, nenhum plano pago é ativado."}, 400)
+            method_pay = data.get("method", "pix")
+            external_ref = f"sub-{cid}-{plan['id']}-{int(datetime.datetime.now().timestamp())}"
+            notification_url = self.base_url() + "/api/webhooks/mercadopago"
+            try:
+                if method_pay == "card":
+                    result = integ.mp_create_preference(config, [{"title": f"Assinatura ProdutoVenda IA — Plano {plan['name']} (mensal)", "quantity": 1, "unit_price": plan["price"]}], external_ref, self.base_url(), notification_url)
+                    qr, qrb64 = "", ""
+                else:
+                    result = integ.mp_create_pix(config, float(plan["price"]), f"Assinatura ProdutoVenda IA — Plano {plan['name']} (mensal)", user["email"], external_ref, notification_url)
+                    qr, qrb64 = result.get("qr_code", ""), result.get("qr_code_base64", "")
+            except IntegrationError as e:
+                return self.send_json({"error": f"Mercado Pago recusou: {e} {integ.provider_error_detail(e.detail)}".strip()}, e.status)
+            conn.execute("INSERT INTO subscriptions(company_id,plan_id,provider,external_reference,status,amount,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                         (cid, plan["id"], "mercadopago", external_ref, "pendente", float(plan["price"]), now(), now()))
+            cur = conn.execute("INSERT INTO payments(company_id,order_id,provider,external_id,external_reference,method,amount,status,qr_code,qr_code_base64,checkout_url,raw,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                               (cid, None, "mercadopago", result["external_id"], external_ref, method_pay, float(plan["price"]), result["status"], qr, qrb64, result.get("checkout_url", ""), json.dumps(result.get("raw", {}), ensure_ascii=False)[:8000], now(), now()))
+            log_audit(conn, cid, user["id"], "billing_subscribe_pending", f"{plan['name']} via {method_pay}")
+            payment = dict(conn.execute("SELECT * FROM payments WHERE id=?", (cur.lastrowid,)).fetchone())
+            payment.pop("raw", None)
+            return self.send_json({"ok": True, "active": False, "payment": payment,
+                                   "message": f"Cobrança da assinatura {plan['name']} gerada! Assim que o pagamento for aprovado (webhook), o plano é ativado automaticamente por 30 dias."}, 201)
+        if path == "/api/reports/export.csv" and method == "GET":
+            kind = (query.get("type") or ["orders"])
+            kind = kind[0] if isinstance(kind, list) else kind
+            output = io.StringIO()
+            writer = csv.writer(output, delimiter=";")
+            if kind == "products":
+                writer.writerow(["produto", "preco", "custo", "estoque", "vendas", "status"])
+                for r in conn.execute("SELECT * FROM products WHERE company_id=? ORDER BY sales DESC", (cid,)):
+                    writer.writerow([r["name"], r["price"], r["cost"], r["stock"], r["sales"], r["status"]])
+            elif kind == "customers":
+                writer.writerow(["cliente", "email", "telefone", "cidade", "segmento", "compras", "total_gasto", "ultima_compra", "vip", "consentimento"])
+                for r in conn.execute("SELECT * FROM customers WHERE company_id=? ORDER BY total_spent DESC", (cid,)):
+                    writer.writerow([r["name"], r["email"], r["phone"], r["city"], r["segment"], r["purchases"], r["total_spent"], r["last_purchase"] or "", r["vip"], r["consent"]])
+            elif kind == "payments":
+                writer.writerow(["id", "pedido", "metodo", "valor", "status_mp", "id_externo", "referencia", "criado_em"])
+                for r in conn.execute("SELECT * FROM payments WHERE company_id=? ORDER BY id DESC", (cid,)):
+                    writer.writerow([r["id"], r["order_id"] or "", r["method"], r["amount"], r["status"], r["external_id"], r["external_reference"] if "external_reference" in r.keys() else "", r["created_at"]])
+            else:
+                kind = "orders"
+                writer.writerow(["pedido", "data", "cliente", "canal", "total", "lucro_estimado", "status", "cupom"])
+                for r in conn.execute("SELECT * FROM orders WHERE company_id=? ORDER BY id DESC", (cid,)):
+                    writer.writerow([r["id"], (r["created_at"] or "")[:10], r["customer_name"], r["channel"], r["total"], r["profit"], r["status"], r["coupon"] or ""])
+            log_audit(conn, cid, user["id"], "report_csv", kind)
+            return self.send_download(f"relatorio-{kind}.csv", "\ufeff" + output.getvalue())
+
         if path == "/api/admin/plan" and method == "POST":
             conn.execute("UPDATE companies SET plan_id=? WHERE id=?", (int(data.get("plan_id")), cid))
             log_audit(conn, cid, user["id"], "plan_change", f"Plano alterado para {data.get('plan_id')}")
@@ -974,7 +1120,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- CRUD generico (sempre filtrado por tenant)
     TABLES = {
-        "products": ["category_id", "name", "description", "price", "cost", "stock", "audience", "icon", "status"],
+        "products": ["category_id", "name", "description", "price", "cost", "stock", "audience", "icon", "status", "image"],
         "customers": ["name", "email", "phone", "city", "segment", "consent", "vip", "birthday"],
         "leads": ["name", "company", "email", "phone", "city", "segment", "source", "stage", "potential", "value", "notes", "next_action"],
         "orders": ["customer_name", "total", "profit", "status", "channel", "coupon"],
@@ -1141,6 +1287,15 @@ class Handler(BaseHTTPRequestHandler):
     def apply_mp_status(self, conn, payment, mp_status, raw):
         previous = payment["status"]
         conn.execute("UPDATE payments SET status=?, raw=?, updated_at=? WHERE id=?", (mp_status, json.dumps(raw, ensure_ascii=False)[:8000], now(), payment["id"]))
+        external_ref = (payment["external_reference"] if "external_reference" in payment.keys() else "") or (raw.get("external_reference") if isinstance(raw, dict) else "") or ""
+        if mp_status == "approved" and previous != "approved" and str(external_ref).startswith("sub-"):
+            sub = conn.execute("SELECT * FROM subscriptions WHERE company_id=? AND external_reference=? AND status!='ativa'", (payment["company_id"], external_ref)).fetchone()
+            if sub:
+                period_end = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+                conn.execute("UPDATE subscriptions SET status='ativa', current_period_end=?, updated_at=? WHERE id=?", (period_end, now(), sub["id"]))
+                conn.execute("UPDATE companies SET plan_id=? WHERE id=?", (sub["plan_id"], payment["company_id"]))
+                plan = conn.execute("SELECT name FROM plans WHERE id=?", (sub["plan_id"],)).fetchone()
+                notify(conn, payment["company_id"], "💎 Assinatura ativada!", f"Plano {plan['name'] if plan else sub['plan_id']} ativo até {period_end}. Obrigado!", "success")
         if mp_status == "approved" and previous != "approved" and payment["order_id"]:
             order = conn.execute("SELECT * FROM orders WHERE id=? AND company_id=?", (payment["order_id"], payment["company_id"])).fetchone()
             if order:
@@ -1160,6 +1315,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.apply_mp_status(conn, payment, raw.get("status", payment["status"]), raw)
             except Exception as e:
                 print(f"[webhook mercadopago] {e}")
+        else:
+            # Pagamento de Checkout Pro: o ID do webhook e o do pagamento (nao o da preferencia).
+            # Busca a empresa dona tentando consultar o pagamento e casa pela external_reference.
+            for row in conn.execute("SELECT DISTINCT company_id FROM integrations WHERE provider='mercadopago' AND active=1").fetchall():
+                config = integ.get_config(conn, row["company_id"], "mercadopago", active_only=True)
+                if not integ.configured_status("mercadopago", config)[0]:
+                    continue
+                try:
+                    raw = integ.mp_get_payment(config, payment_external_id)
+                except Exception:
+                    continue
+                ext_ref = raw.get("external_reference") or ""
+                local = conn.execute("SELECT * FROM payments WHERE company_id=? AND external_reference=?", (row["company_id"], ext_ref)).fetchone() if ext_ref else None
+                if local:
+                    conn.execute("UPDATE payments SET external_id=? WHERE id=?", (str(payment_external_id), local["id"]))
+                    local = conn.execute("SELECT * FROM payments WHERE id=?", (local["id"],)).fetchone()
+                    self.apply_mp_status(conn, local, raw.get("status", local["status"]), raw)
+                break
         return self.send_json({"received": True})
 
     def payments_create(self, conn, company, user, data):
@@ -1198,8 +1371,8 @@ class Handler(BaseHTTPRequestHandler):
                 qr, qrb64 = result.get("qr_code", ""), result.get("qr_code_base64", "")
         except IntegrationError as e:
             return self.send_json({"error": f"Mercado Pago recusou a criação: {e} {integ.provider_error_detail(e.detail)}".strip()}, e.status)
-        cur = conn.execute("INSERT INTO payments(company_id,order_id,provider,external_id,method,amount,status,qr_code,qr_code_base64,checkout_url,raw,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                           (cid, order["id"] if order else None, "mercadopago", result["external_id"], method, amount, result["status"], qr, qrb64, result.get("checkout_url", ""), json.dumps(result.get("raw", {}), ensure_ascii=False)[:8000], now(), now()))
+        cur = conn.execute("INSERT INTO payments(company_id,order_id,provider,external_id,external_reference,method,amount,status,qr_code,qr_code_base64,checkout_url,raw,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (cid, order["id"] if order else None, "mercadopago", result["external_id"], external_ref, method, amount, result["status"], qr, qrb64, result.get("checkout_url", ""), json.dumps(result.get("raw", {}), ensure_ascii=False)[:8000], now(), now()))
         log_audit(conn, cid, user["id"], "payment_create", f"{method} {amount} ext={result['external_id']}")
         payment = dict(conn.execute("SELECT * FROM payments WHERE id=?", (cur.lastrowid,)).fetchone())
         payment.pop("raw", None)
@@ -1268,8 +1441,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     result = integ.mp_create_pix(mp_cfg, total, f"Pedido #{order_id} — {company['name']}", data.get("email") or customer["email"], f"order-{order_id}", notification_url)
                     qr, qrb64 = result.get("qr_code", ""), result.get("qr_code_base64", "")
-                cur = conn.execute("INSERT INTO payments(company_id,order_id,provider,external_id,method,amount,status,qr_code,qr_code_base64,checkout_url,raw,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                   (cid, order_id, "mercadopago", result["external_id"], payment_method, total, result["status"], qr, qrb64, result.get("checkout_url", ""), json.dumps(result.get("raw", {}), ensure_ascii=False)[:8000], now(), now()))
+                cur = conn.execute("INSERT INTO payments(company_id,order_id,provider,external_id,external_reference,method,amount,status,qr_code,qr_code_base64,checkout_url,raw,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                   (cid, order_id, "mercadopago", result["external_id"], f"order-{order_id}", payment_method, total, result["status"], qr, qrb64, result.get("checkout_url", ""), json.dumps(result.get("raw", {}), ensure_ascii=False)[:8000], now(), now()))
                 payment_info = {"id": cur.lastrowid, "method": payment_method, "status": result["status"], "qr_code": qr, "qr_code_base64": qrb64, "checkout_url": result.get("checkout_url", "")}
             except IntegrationError as e:
                 payment_info = {"method": payment_method, "status": "erro", "error": f"{e} {integ.provider_error_detail(e.detail)}".strip()}

@@ -118,3 +118,8 @@ tr:hover td{background:color-mix(in srgb,var(--panel2) 45%,transparent)}
  .menu-btn{display:inline-flex!important}
 }
 .menu-btn{display:none}
+@media print{
+  .sidebar,.topbar,#toast,.modal-back,.btn,.icon-btn{display:none!important}
+  .shell{display:block}.content{padding:0;max-width:none}
+  body{background:#fff;color:#000}.card{box-shadow:none;border:1px solid #ddd;break-inside:avoid}
+}

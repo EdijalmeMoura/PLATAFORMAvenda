@@ -1,5 +1,6 @@
 plataformavenda.db
 *.db
+uploads/
 .pv_master_key
 .env
 __pycache__/

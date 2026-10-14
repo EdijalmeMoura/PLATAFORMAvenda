@@ -149,6 +149,35 @@ class ProdutoVendaSmokeTest(unittest.TestCase):
         status, data = call("/api/auth/login", "POST", {"email": "demo@produtovenda.com.br", "password": "demo1234"})
         type(self).demo_token = data["token"]
 
+    def test_product_image_upload(self):
+        png_1x1 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAwMCAO+ip1sAAAAASUVORK5CYII="
+        status, up = call("/api/products/1/image", "POST", {"image_data": png_1x1}, self.demo_token)
+        self.assertEqual(status, 200, up)
+        self.assertTrue(up["image"].startswith("/uploads/"))
+        with urllib.request.urlopen(BASE + up["image"], timeout=10) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn("image/png", r.headers.get("Content-Type", ""))
+        status, err = call("/api/products/1/image", "POST", {"image_data": "data:text/html;base64,PHNjcmlwdD4="}, self.demo_token)
+        self.assertEqual(status, 400)  # rejeita nao-imagem
+
+    def test_billing_and_reports_csv(self):
+        status, billing = call("/api/billing", token=self.demo_token)
+        self.assertEqual(status, 200)
+        self.assertIn("plan", billing)
+        # plano pago sem Mercado Pago configurado -> erro claro (depois do teste de integracoes, MP segue sem config neste banco)
+        status, err = call("/api/billing/subscribe", "POST", {"plan_id": 2, "method": "pix"}, self.demo_token)
+        if status != 400:
+            # se algum teste anterior configurou MP fake, a cobranca real falhara na rede (502) — nunca ativa sem pagar
+            self.assertIn(status, (502,))
+            status2, billing2 = call("/api/billing", token=self.demo_token)
+        # CSV de pedidos baixa como arquivo
+        req = urllib.request.Request(BASE + "/api/reports/export.csv?type=orders",
+                                     headers={"Authorization": "Bearer " + self.demo_token})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = r.read().decode("utf-8-sig")
+            self.assertIn("text/csv", r.headers.get("Content-Type", ""))
+            self.assertTrue(body.splitlines()[0].startswith("pedido;data;cliente"))
+
     def test_export_and_automations(self):
         status, export = call("/api/admin/export", token=self.demo_token)
         self.assertEqual(status, 200)

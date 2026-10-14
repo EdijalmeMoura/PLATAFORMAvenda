@@ -1,0 +1,20 @@
+# Uso: docker compose -f docker-compose.yml -f deploy/docker-compose.caddy.yml up -d
+services:
+  caddy:
+    image: caddy:2
+    container_name: produtovenda-caddy
+    depends_on:
+      - produtovenda
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    network_mode: host
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:

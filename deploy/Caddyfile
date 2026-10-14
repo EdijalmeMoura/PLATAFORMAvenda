@@ -1,0 +1,14 @@
+# Troque pelo seu dominio. O Caddy emite/renova o HTTPS (Let's Encrypt) sozinho.
+app.suaempresa.com.br {
+	reverse_proxy 127.0.0.1:8000
+	encode gzip
+
+	# Fotos de produtos podem ter ate 2 MB
+	request_body {
+		max_size 5MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+}

@@ -118,8 +118,15 @@ Configuráveis por empresa em **Admin & Planos → Integrações reais**, com cr
 
 Sem credencial configurada, nada é simulado: envios ficam em fila, cobranças não são criadas e o erro do provedor é mostrado com a explicação.
 
+## ✨ Funcionalidades em destaque (v1.3)
+
+- **📷 Fotos reais de produtos**: upload PNG/JPG/WEBP (até 2 MB, validado) servido de `/uploads`, exibido no painel e na vitrine da loja (sem foto, usa o ícone).
+- **💎 Billing de planos**: assinar FREE na hora ou plano pago via **Pix/Checkout Pro do Mercado Pago** — a assinatura é ativada automaticamente por 30 dias quando o webhook confirma o pagamento (`/api/billing`, histórico em Admin).
+- **📊 Relatórios exportáveis**: CSV de pedidos/produtos/clientes/pagamentos (padrão Excel BR) e **Imprimir/Salvar PDF** direto da tela de relatórios.
+- **🚀 Deploy público com HTTPS**: guia completo em [DEPLOY.md](DEPLOY.md) (Docker + Caddy com HTTPS automático, ou systemd + Nginx/Certbot), com arquivos prontos em `deploy/` — é o que libera os webhooks da Meta/Mercado Pago em produção.
+
 ## 🔮 Próximos passos sugeridos
 
-1. Trocar/complementar o motor de IA local por LLM externo com a chave da plataforma.
-2. Billing real dos planos (assinaturas recorrentes) e domínio customizado por loja.
-3. Publicação automática no Instagram após aprovação de permissões da Meta.
+1. Colocar no ar num domínio próprio (ver [DEPLOY.md](DEPLOY.md)) e ativar as integrações com credenciais de produção.
+2. Trocar/complementar o motor de IA local por LLM externo com a chave da plataforma.
+3. Publicação automática no Instagram após aprovação de permissões da Meta e domínio customizado por loja.
