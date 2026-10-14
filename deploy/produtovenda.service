@@ -1,0 +1,21 @@
+[Unit]
+Description=ProdutoVenda IA — Central de Vendas com IA
+After=network.target
+
+[Service]
+Type=simple
+User=produtovenda
+WorkingDirectory=/opt/produtovenda
+Environment=PORT=8000
+Environment=PV_DB_PATH=/var/lib/produtovenda/plataformavenda.db
+Environment=PV_UPLOAD_DIR=/var/lib/produtovenda/uploads
+# Defina sua chave forte (criptografa as credenciais das integrações):
+Environment=PV_MASTER_KEY=troque-por-uma-chave-forte-e-secreta
+ExecStart=/usr/bin/python3 /opt/produtovenda/server.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

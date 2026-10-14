@@ -1,0 +1,8 @@
+plataformavenda.db
+*.db
+uploads/
+.pv_master_key
+.env
+__pycache__/
+*.pyc
+.DS_Store
