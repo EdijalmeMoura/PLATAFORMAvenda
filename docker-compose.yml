@@ -8,6 +8,8 @@ services:
       # TROQUE por uma chave forte e guarde fora do repositorio.
       # Ela criptografa as credenciais das integracoes no banco.
       PV_MASTER_KEY: "troque-por-uma-chave-forte-e-secreta"
+      # URL publica (aparece nos links de senha, webhooks e back_urls de pagamento):
+      PV_PUBLIC_URL: "https://app.suaempresa.com.br"
       PORT: "8000"
     volumes:
       - produtovenda-data:/app/data

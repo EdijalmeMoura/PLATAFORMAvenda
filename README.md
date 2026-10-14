@@ -31,10 +31,10 @@ docker compose up -d --build
 ### 🧪 Testes automatizados
 
 ```bash
-python3 -m unittest discover -s tests -v   # 6 smoke tests com servidor+banco temporários
+python3 -m unittest discover -s tests -v   # 24 testes (smoke + regras de venda) com servidor+banco temporários
 ```
 
-Cobrem: health, login/dashboard, isolamento multi-tenant, loja pública (carrinho salvo → checkout com cupom → avaliação), integrações (segredo mascarado **e criptografado em repouso**), webhook do WhatsApp, recuperação de senha completa e exportação sem segredos.
+Cobrem: health, login/dashboard, isolamento multi-tenant, loja pública (carrinho salvo → checkout com cupom → avaliação), integrações (segredo mascarado **e criptografado em repouso**), webhook do WhatsApp, recuperação de senha completa, exportação sem segredos, **cupom que não deixa total negativo, cobrança online sem gateway recusada, estoque atômico (inclusive com dois pedidos simultâneos), venda sob encomenda, limite de payload, rate limiting, índices/WAL e páginas públicas `/loja/<slug>` com Open Graph**.
 
 ### 🔑 Conta de demonstração (caso de uso inicial: Chocolates 🍫)
 
@@ -117,6 +117,32 @@ Configuráveis por empresa em **Admin & Planos → Integrações reais**, com cr
 | **Meta Social** | Teste/validação de Página do Facebook/Instagram pelas APIs oficiais |
 
 Sem credencial configurada, nada é simulado: envios ficam em fila, cobranças não são criadas e o erro do provedor é mostrado com a explicação.
+
+## 🛠️ Melhorias recentes (v1.4) — confiabilidade, segurança e link de loja profissional
+
+**Correções de negócio (valem dinheiro de verdade):**
+
+- **Cupom nunca gera pedido negativo**: desconto fixo maior que o carrinho era subtraído do total e podia deixar o pedido com valor negativo. Agora o desconto é limitado ao valor do carrinho (pedido mínimo R$ 0,00) e o cupom é validado na criação (percentual ≤ 100%, valor > 0, código único por empresa, normalizado em maiúsculas).
+- **Pagamento online não é mais marcado como pago sem gateway**: se o cliente escolhia Pix/cartão sem o Mercado Pago conectado, o pedido entrava como **pago** sem nenhum dinheiro ter entrado. Agora a loja recusa a opção e orienta a combinar o pagamento — pedido só é marcado como pago quando o pagamento realmente existe.
+- **Estoque à prova de concorrência**: a baixa é atômica e condicionada ao estoque disponível; dois pedidos simultâneos da última unidade resultam em **1 venda** (o segundo recebe 409 e nada do pedido fica salvo). Antes, o estoque podia ficar negativo.
+- **Nada de pedido pela metade**: toda rota de API agora confirma a transação apenas em caso de sucesso — erro no meio do fluxo faz *rollback* completo (pedido, itens, estoque, cupom). A resposta HTTP também só é enviada **depois** do commit: quem chama a API e lê de volta na sequência (como faz o painel) nunca vê dado desatualizado.
+- **Sob encomenda (opcional)**: por padrão a loja bloqueia a compra sem estoque ("Esgotado"); em **Minha Store** o lojista pode ativar *vender itens sob encomenda* e aí a vitrine mostra "Sob encomenda" e aceita o pedido sem deixar estoque negativo.
+- **Entradas do cliente não derrubam a API**: quantidades estranhas ("abc", vazio, texto), valores monetários e payloads gigantes passam por validação/coerção (o limite de corpo é 8 MB e devolve 413, não memória ilimitada).
+
+**Segurança e operação:**
+
+- **Links sem depender do header Host**: `PV_PUBLIC_URL` define a URL canônica usada em e-mails, webhooks e back_urls (evita host header injection); sem ela, o Host é validado por regex.
+- **Rate limiting ampliado**: além do login (por e-mail e por IP), agora há limite em cadastro, recuperação/redefinição de senha, carrinho, checkout e avaliações — com resposta 429 e mensagem clara.
+- **Erros internos não vazam detalhes**: falhas retornam mensagem genérica ao cliente e são registradas no log do servidor (`stderr`); indisponibilidade do banco devolve 503 em vez de 500 opaco.
+- **CSP e HSTS**: Content-Security-Policy restritiva (com `unsafe-inline` necessário ao SPA) e `Strict-Transport-Security` automático sob HTTPS; sessões e tokens de redefinição vencidos são purgados periodicamente.
+- **SQLite em WAL + 32 índices**: leituras concorrentes sem bloquear escritas e consultas por `company_id` indexadas (antes eram varreduras completas) — painel e relatórios ficam mais rápidos conforme os dados crescem.
+- **Health check melhorado**: `/api/health` traz versão, base de dados, uptime, URL pública.
+
+**Link da loja profissional (novo):**
+
+- **URL amigável**: cada loja ganha `https://seu-dominio/loja/<slug>` (e `/loja/<slug>/produto/<id>` para um item específico), renderizada no servidor com **preview no WhatsApp/Facebook** (Open Graph + Twitter Card), **dados estruturados schema.org** (Google), `robots.txt` e `sitemap.xml`.
+- **Compartilhar em 1 clique**: botões *Compartilhar no WhatsApp* na loja e em cada produto (com nome e preço já na mensagem) e "Copiar link" usando o endereço bonito.
+- **Item esgotado**: o card mostra "Esgotado" e oferece "Avise a loja: quero este item" (abre o WhatsApp da loja com a mensagem pronta) em vez de deixar o cliente comprar o que não existe.
 
 ## ✨ Funcionalidades em destaque (v1.3)
 

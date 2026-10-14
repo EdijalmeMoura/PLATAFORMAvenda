@@ -1,5 +1,8 @@
 plataformavenda.db
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 uploads/
 .pv_master_key
 .env

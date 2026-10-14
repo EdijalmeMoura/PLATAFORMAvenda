@@ -13,10 +13,10 @@ Para os **webhooks da Meta (WhatsApp) e do Mercado Pago funcionarem**, o sistema
 
 1. No servidor, clone e configure:
    ```bash
-   git clone -b arena/34496ed2-plataformavenda https://github.com/EdijalmeMoura/PLATAFORMAvenda.git
+   git clone https://github.com/EdijalmeMoura/PLATAFORMAvenda.git
    cd PLATAFORMAvenda
    cp .env.example .env
-   # edite .env: defina PV_MASTER_KEY forte
+   # edite .env: defina PV_MASTER_KEY forte e PV_PUBLIC_URL com o seu domínio
    python3 -c "import secrets; print(secrets.token_hex(32))"   # gere a chave
    ```
 2. Edite `deploy/Caddyfile` e troque `app.suaempresa.com.br` pelo seu domínio.

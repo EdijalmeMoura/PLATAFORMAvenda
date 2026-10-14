@@ -40,7 +40,10 @@ function thumbHtml(p, size = 52) {
   return `<span class="prod-thumb" style="width:${size}px;height:${size}px;font-size:${Math.round(size * 0.52)}px">${esc(p.icon || "🎁")}</span>`;
 }
 function statusBadge(s) { const map = { pago: "b-green", ativa: "b-green", ativo: "b-green", enviada: "b-violet", Proposta: "b-violet", Interessado: "b-violet", "Novo Lead": "b-amber", pendente: "b-amber", agendado: "b-amber", abandonado: "b-red", Perdido: "b-red", entregue: "b-green", "No CRM": "b-green" }; return badge(s || "-", map[s] || "b-gray"); }
-async function copyText(text, msg = "Copiado!") { try { await navigator.clipboard.writeText(text); toast(msg, "ok"); } catch { toast("Copie manualmente: " + text); } }
+async function copyText(text, msg = "Copiado!") {
+  try { await navigator.clipboard.writeText(text); toast(msg, "ok"); }
+  catch { window.prompt("Copie o link/código abaixo (Ctrl+C):", text); }
+}
 
 /* ================= AUTH ================= */
 function renderAuth(mode = "login") {
@@ -125,6 +128,10 @@ function shell(contentHtml, title) {
   $("#command-form").onsubmit = (e) => { e.preventDefault(); state.pendingAi = $("#command-input").value; App.go("agente"); };
 }
 function storeUrl() { return location.origin + location.pathname + "#/loja/" + state.me.company.slug; }
+// Link público bonito (servido pelo backend com preview no WhatsApp/Facebook/Google)
+function publicStoreUrl() { return location.origin + "/loja/" + state.me.company.slug; }
+function publicProductUrl(id) { return publicStoreUrl() + "/produto/" + id; }
+function shareWhatsApp(text) { window.open("https://wa.me/?text=" + encodeURIComponent(text), "_blank", "noopener"); }
 async function boot() {
   const resetToken = new URLSearchParams(location.search).get("reset_token");
   if (resetToken) return renderReset(resetToken);
@@ -263,13 +270,13 @@ async function viewProdutos() {
   ${products.length ? `<div class="grid g2">${products.map(p => { const margin = p.price ? Math.round((p.price - (p.cost || 0)) / p.price * 100) : 0; return `<div class="card"><div class="row">${thumbHtml(p)}<div style="flex:1"><b>${esc(p.name)}</b><br><span class="small mut">${esc(p.audience || "")}</span></div>${(p.stock || 0) <= 20 ? badge("Estoque baixo: " + p.stock, "b-red") : badge("Estoque: " + p.stock, "b-green")}</div>
     <p class="small mut mt" style="min-height:36px">${esc((p.description || "").slice(0, 130))}…</p>
     <div class="row small"><span>💰 <b>${money(p.price)}</b></span><span>Custo ${money(p.cost)}</span><span>Margem ${margin}%</span><span>🏆 ${p.sales || 0} vendas</span>${p.ai_page ? badge("Página IA ✓", "b-violet") : ""}</div>
-    <div class="row mt"><button class="btn sm" onclick="App.generatePage(${p.id})">✨ GERAR PÁGINA COM IA</button><button class="btn sm soft" onclick="App.productImage(${p.id})">📷 ${p.image ? "Trocar foto" : "Enviar foto"}</button><button class="btn sm soft" onclick="App.campaignFor(${p.id})">📣 Campanha</button><button class="btn sm ghost" onclick="App.productForm(${p.id})">Editar</button><button class="btn sm ghost" onclick="App.del('/api/products/${p.id}','Produto removido')">🗑️</button></div></div>`; }).join("")}</div>` : `<div class="empty">📦 Nenhum produto ainda.<br><br><button class="btn" onclick="App.productForm()">Cadastrar primeiro produto</button></div>`}`, "Produtos — Modo Produto");
+    <div class="row mt"><button class="btn sm" onclick="App.generatePage(${p.id})">✨ GERAR PÁGINA COM IA</button><button class="btn sm soft" onclick="App.productImage(${p.id})">📷 ${p.image ? "Trocar foto" : "Enviar foto"}</button><button class="btn sm soft" onclick="App.shareProduct(${p.id})">📲 Compartilhar</button><button class="btn sm soft" onclick="App.campaignFor(${p.id})">📣 Campanha</button><button class="btn sm ghost" onclick="App.productForm(${p.id})">Editar</button><button class="btn sm ghost" onclick="App.del('/api/products/${p.id}','Produto removido')">🗑️</button></div></div>`; }).join("")}</div>` : `<div class="empty">📦 Nenhum produto ainda.<br><br><button class="btn" onclick="App.productForm()">Cadastrar primeiro produto</button></div>`}`, "Produtos — Modo Produto");
   state._products = products;
 }
 async function viewLoja() {
   const [{ store, company }, { products }] = await Promise.all([api("/api/settings"), api("/api/products")]);
-  shell(`<div class="card"><div class="row between"><div><h3>🏪 Minha Store — ${esc(store.store_name || company.name)}</h3><p class="mut">Sua loja é gerada automaticamente a partir dos produtos. Compartilhe o link e venda com carrinho, checkout e cupom.</p></div><div class="row"><button class="btn ghost" onclick="App.copyStoreLink()">🔗 Copiar link da loja</button><button class="btn" onclick="App.openPublicStore()">Ver loja →</button></div></div>
-  <p class="small mt">Link público: <a href="${storeUrl()}" target="_blank">${storeUrl()}</a></p></div>
+  shell(`<div class="card"><div class="row between"><div><h3>🏪 Minha Store — ${esc(store.store_name || company.name)}</h3><p class="mut">Sua loja é gerada automaticamente a partir dos produtos. Compartilhe o link e venda com carrinho, checkout e cupom.</p></div><div class="row"><button class="btn ghost" onclick="App.copyStoreLink()">🔗 Copiar link</button><button class="btn soft" onclick="App.shareStore()">📲 Compartilhar no WhatsApp</button><button class="btn" onclick="App.openPublicStore()">Ver loja →</button></div></div>
+  <p class="small mt">Link público (com preview no WhatsApp): <a href="${publicStoreUrl()}" target="_blank" rel="noopener">${publicStoreUrl()}</a></p></div>
   <div class="grid g2 mt"><div class="card"><h3>🎨 Personalização</h3><form id="store-form">
     <label class="f">Nome da loja</label><input id="s-name" value="${esc(store.store_name || "")}">
     <label class="f">Logo (emoji)</label><input id="s-logo" value="${esc(store.logo || "🛍️")}">
@@ -277,6 +284,8 @@ async function viewLoja() {
     <label class="f">Banner / chamada principal</label><input id="s-banner" value="${esc(store.banner || "")}" placeholder="Ex.: Feito à mão para presentear quem você ama">
     <label class="f">Descrição da loja</label><textarea id="s-desc">${esc(store.description || "")}</textarea>
     <label class="f">Instagram</label><input id="s-insta" value="${esc(store.instagram || "")}">
+    <label class="f row" style="gap:8px;align-items:center"><input type="checkbox" id="s-backorder" style="width:auto" ${store.allow_backorder ? "checked" : ""}> Vender itens <b>sob encomenda</b> quando o estoque estiver zerado</label>
+    <p class="small mut" style="margin:4px 0 0">Desmarcado, a loja bloqueia a compra quando não há estoque (evita vender o que não tem).</p>
     <button class="btn mt" type="submit">Salvar personalização</button></form></div>
   <div class="card"><h3>🛍️ Vitrine atual (${products.length} produtos)</h3>${products.map(p => `<div class="row between" style="padding:8px 0;border-bottom:1px solid var(--line)"><span class="row"><span class="prod-thumb" style="width:38px;height:38px;font-size:19px">${esc(p.icon || "🎁")}</span>${esc(p.name)}</span><span><b>${money(p.price)}</b> ${statusBadge(p.status)}</span></div>`).join("")}
   <p class="small mut mt">💡 Dica da IA: gere a página de cada produto com IA (título, benefícios, FAQ e CTA) para converter mais. Páginas prontas aparecem na loja pública.</p>
@@ -284,7 +293,7 @@ async function viewLoja() {
   $("#store-form").onsubmit = async (e) => {
     e.preventDefault();
     const s = await api("/api/settings");
-    await api("/api/settings", "PUT", { ...s.company, store_name: $("#s-name").value, logo: $("#s-logo").value, primary_color: $("#s-color").value, banner: $("#s-banner").value, store_description: $("#s-desc").value, instagram: $("#s-insta").value });
+    await api("/api/settings", "PUT", { ...s.company, store_name: $("#s-name").value, logo: $("#s-logo").value, primary_color: $("#s-color").value, banner: $("#s-banner").value, store_description: $("#s-desc").value, instagram: $("#s-insta").value, allow_backorder: $("#s-backorder").checked ? 1 : 0 });
     toast("Loja personalizada! 🎨", "ok"); state.me = await api("/api/auth/me"); viewLoja();
   };
 }
@@ -293,15 +302,18 @@ async function renderPublicStore(slug) {
   let data; try { data = await api("/api/public/store/" + slug); } catch (e) { $("#app").innerHTML = `<div class="empty" style="margin:40px">${esc(e.message)}<br><br><a href="#/dashboard">Voltar</a></div>`; return; }
   state.publicData = data;
   const s = data.settings || {}; const color = s.primary_color || "#7c3aed";
+  const backorder = !!(s.allow_backorder);
   const render = () => {
     const cartTotal = state.cart.reduce((a, c) => a + c.price * c.qty, 0);
     $("#app").innerHTML = `<div style="max-width:1150px;margin:0 auto;padding:22px">
     <div class="row between"><b style="font-size:19px">${esc(s.logo || "🛍️")} ${esc(s.store_name || data.company.name)}</b><span class="row"><button class="btn ghost sm" onclick="location.hash='#/dashboard'">← Painel</button><button class="btn sm" style="background:${color}" onclick="document.getElementById('cart-section').scrollIntoView({behavior:'smooth'})">🛒 Carrinho (${state.cart.reduce((a, c) => a + c.qty, 0)}) · ${money(cartTotal)}</button></span></div>
     <div class="store-hero mt" style="--sc:${color};background:linear-gradient(135deg,${color},#db2777)"><span class="chip" style="background:rgba(255,255,255,.18);color:#fff;border:none">${esc(data.company.segment || "")} · ${esc(data.company.city || "")}</span><h1 style="margin:12px 0 6px;font-size:32px">${esc(s.banner || s.store_name || data.company.name)}</h1><p style="opacity:.92;max-width:620px">${esc(s.description || "")}</p><p class="small" style="opacity:.85">💬 Pedidos e dúvidas também pelo WhatsApp ${esc(data.company.whatsapp || "")} ${s.instagram ? "· Instagram " + esc(s.instagram) : ""}</p></div>
-    <h3 class="mt">🛍️ Produtos</h3><div class="store-grid">${data.products.map(p => { let page = {}; try { page = JSON.parse(p.page_data || "{}"); } catch {} return `<div class="store-card">${p.image ? `<img src="${esc(p.image)}" alt="${esc(p.name)}" style="width:100%;height:150px;object-fit:cover;display:block">` : `<div style="height:130px;background:linear-gradient(135deg,#ede9fe,#fce7f3);display:flex;align-items:center;justify-content:center;font-size:58px">${esc(p.icon || "🎁")}</div>`}<div class="body"><b>${esc(p.name)}</b><p class="small mut" style="min-height:34px">${esc(page.subtitle || (p.description || "").slice(0, 80))}</p><div class="row between"><b style="font-size:17px">${money(p.price)}</b><span class="small mut">${(p.stock || 0) > 0 ? p.stock + " em estoque" : "Sob encomenda"}</span></div>
+    <h3 class="mt">🛍️ Produtos</h3><div class="store-grid">${data.products.map(p => { let page = {}; try { page = JSON.parse(p.page_data || "{}"); } catch {} return `<div class="store-card">${p.image ? `<img src="${esc(p.image)}" alt="${esc(p.name)}" style="width:100%;height:150px;object-fit:cover;display:block">` : `<div style="height:130px;background:linear-gradient(135deg,#ede9fe,#fce7f3);display:flex;align-items:center;justify-content:center;font-size:58px">${esc(p.icon || "🎁")}</div>`}<div class="body"><b>${esc(p.name)}</b><p class="small mut" style="min-height:34px">${esc(page.subtitle || (p.description || "").slice(0, 80))}</p><div class="row between"><b style="font-size:17px">${money(p.price)}</b><span class="small mut">${(p.stock || 0) > 0 ? p.stock + " em estoque" : (backorder ? "Sob encomenda" : "Esgotado")}</span></div>
     ${page.benefits ? `<p class="small" style="margin:8px 0">✨ ${esc(page.benefits[0])}<br>🎁 ${esc(page.benefits[2] || "")}</p>` : ""}
     ${page.faq ? `<details class="small mut"><summary style="cursor:pointer;font-weight:700">Perguntas frequentes</summary>${page.faq.map(f => `<p><b>${esc(f.q)}</b><br>${esc(f.a)}</p>`).join("")}</details>` : ""}
-    <button class="btn block mt" style="background:${color}" onclick="App.addCart(${p.id})">Adicionar ao carrinho 🛒</button></div></div>`; }).join("")}</div>
+    ${(p.stock || 0) > 0 || backorder
+      ? `<button class="btn block mt" style="background:${color}" onclick="App.addCart(${p.id})">Adicionar ao carrinho 🛒</button>`
+      : `<button class="btn block mt ghost" disabled title="Sem estoque">Esgotado 😕</button><button class="btn block mt ghost sm" onclick="App.askRestock(${p.id})">🔔 Avise a loja: quero este item</button>`}</div></div>`; }).join("")}</div>
     ${data.reviews.length ? `<h3 class="mt">⭐ O que dizem nossos clientes</h3><div class="grid g3">${data.reviews.map(r => `<div class="card"><b>${"⭐".repeat(r.rating || 5)}</b><p class="small">"${esc(r.comment)}"</p><p class="small mut">— ${esc(r.customer_name)}</p></div>`).join("")}</div>` : ""}
     <div class="card mt"><h3>⭐ Avalie sua compra</h3><div class="grid g3"><div><label class="f">Produto</label><select id="rv-product">${data.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select></div><div><label class="f">Seu nome</label><input id="rv-name" placeholder="Ex.: Maria S."></div><div><label class="f">Nota</label><select id="rv-rating">${[5, 4, 3, 2, 1].map(n => `<option value="${n}">${"⭐".repeat(n)}</option>`).join("")}</select></div></div>
     <label class="f">Comentário</label><textarea id="rv-comment" placeholder="Conte como foi sua experiência…"></textarea><button class="btn mt" style="background:${color}" onclick="App.submitReview()">Enviar avaliação</button></div>
@@ -624,7 +636,26 @@ const App = {
   toggleDark: () => { state.dark = !state.dark; document.body.classList.toggle("dark", state.dark); localStorage.setItem("pv_dark", state.dark ? "1" : "0"); route(); },
   askAi: (text) => { state.pendingAi = text; App.go("agente"); },
   openPublicStore: () => { location.hash = "#/loja/" + state.me.company.slug; },
-  copyStoreLink: () => copyText(storeUrl(), "Link da loja copiado! 🔗"),
+  copyStoreLink: () => copyText(publicStoreUrl(), "Link público copiado! 🔗"),
+  askRestock(id) {
+    const d = state.publicData || {};
+    const p = (d.products || []).find(x => x.id === id);
+    if (!p) return;
+    const wa = String((d.company || {}).whatsapp || "").replace(/\D/g, "");
+    const texto = `Olá! Quero comprar o item "${p.name}" (${money(p.price)}) — ele está esgotado na loja. Pode me avisar quando chegar?`;
+    if (wa) { window.open(`https://wa.me/${wa.startsWith("55") ? wa : "55" + wa}?text=${encodeURIComponent(texto)}`, "_blank", "noopener"); return; }
+    copyText(texto, "Mensagem copiada — envie para a loja! 📋");
+  },
+  shareStore: () => {
+    const nome = (state.me.company?.name || "minha loja");
+    shareWhatsApp(`Olá! Dá uma olhada na minha loja ${nome} 🛍️\nConfira os produtos e faça seu pedido por aqui:\n${publicStoreUrl()}`);
+  },
+  shareProduct(id) {
+    const p = (state._products || []).find(x => x.id === id);
+    if (!p) return;
+    const preco = money(p.price);
+    shareWhatsApp(`${p.name} — ${preco} 🛍️\nVeja as fotos e faça seu pedido:\n${publicProductUrl(p.id)}`);
+  },
   obBack: () => { if (obStep > 0) { obStep--; renderOnboarding(); } },
   obSkip: () => { if (obStep < OB_STEPS.length - 1) { obStep++; renderOnboarding(); } },
   setAutopilot: async (v) => { const s = await api("/api/settings"); await api("/api/settings", "PUT", { ...s.company, ...s.store, store_name: s.store.store_name, autopilot: v }); state.me = await api("/api/auth/me"); toast("Autopilot: " + v, "ok"); },
