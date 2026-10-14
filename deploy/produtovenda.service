@@ -11,6 +11,8 @@ Environment=PV_DB_PATH=/var/lib/produtovenda/plataformavenda.db
 Environment=PV_UPLOAD_DIR=/var/lib/produtovenda/uploads
 # Defina sua chave forte (criptografa as credenciais das integrações):
 Environment=PV_MASTER_KEY=troque-por-uma-chave-forte-e-secreta
+# URL publica HTTPS (links de senha, webhooks da Meta/Mercado Pago e pagamentos):
+Environment=PV_PUBLIC_URL=https://app.suaempresa.com.br
 ExecStart=/usr/bin/python3 /opt/produtovenda/server.py
 Restart=on-failure
 RestartSec=3

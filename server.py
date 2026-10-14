@@ -4,7 +4,7 @@ ProdutoVenda IA — Central de Vendas Autônomas com IA
 Backend monolitico (Python stdlib apenas): HTTP + SQLite + autenticacao + multi-tenant + motor de IA local.
 Nenhuma dependencia externa. Dados persistentes em plataformavenda.db
 """
-import base64, csv, io, json, os, re, sqlite3, hashlib, secrets, random, datetime, urllib.parse
+import base64, csv, html as html_lib, io, json, os, re, sqlite3, hashlib, secrets, random, datetime, sys, time, threading, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import integrations as integ
 from integrations import IntegrationError
@@ -14,14 +14,38 @@ DB_PATH = os.environ.get("PV_DB_PATH") or os.path.join(BASE, "plataformavenda.db
 UPLOAD_DIR = os.environ.get("PV_UPLOAD_DIR") or os.path.join(BASE, "uploads")
 STATIC = os.path.join(BASE, "static")
 PORT = int(os.environ.get("PORT", "8000"))
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
+# URL pública canônica (ex.: https://minhaloja.com.br). Quando definida, é usada em
+# links de redefinição de senha, webhooks e back_urls — evita depender do header Host.
+PUBLIC_URL = (os.environ.get("PV_PUBLIC_URL") or "").rstrip("/")
+MAX_BODY_BYTES = int(os.environ.get("PV_MAX_BODY_BYTES") or 8 * 1024 * 1024)  # 8 MB
+STARTED_AT = time.time()
 
 # ---------------------------------------------------------------- DB
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")       # leituras concorrentes sem bloquear escritas
+    except sqlite3.DatabaseError:
+        pass
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+# Índices de uso (multi-tenant: toda query filtra por company_id). Criados de forma idempotente.
+INDEXES = [
+    "products(company_id, status)", "products(company_id, sales DESC)", "customers(company_id)", "customers(company_id, phone)",
+    "orders(company_id, created_at)", "order_items(company_id, order_id)", "coupons(company_id, code)", "coupon_usages(company_id, coupon_id)",
+    "leads(company_id, stage)", "opportunities(company_id, status)", "carts(company_id, status)",
+    "campaigns(company_id, status)", "campaign_contents(company_id, scheduled_at)", "messages(company_id, created_at)",
+    "message_templates(company_id)", "proposals(company_id, status)", "reviews(company_id, product_id)", "referrals(company_id)",
+    "email_campaigns(company_id)", "integrations(company_id, provider)", "payments(external_id)", "payments(company_id, external_reference)",
+    "subscriptions(company_id)", "notifications(company_id, read_flag)", "audit_logs(company_id, created_at)", "automation_runs(company_id, automation_id)",
+    "ai_actions(company_id, created_at)", "ai_usage(company_id, created_at)", "ai_conversations(company_id, created_at)",
+    "sessions(token_hash)", "sessions(expires_at)", "password_resets(token_hash)",
+]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS plans(id INTEGER PRIMARY KEY, name TEXT, price REAL, limits TEXT);
@@ -99,6 +123,29 @@ def hash_pass(password, salt=None):
     h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200000).hex()
     return h, salt
 
+def to_int(value, default=0, minimum=None, maximum=None):
+    """Converte entradas do cliente (texto, '1.5', 'abc') sem derrubar a requisição."""
+    try:
+        out = int(float(str(value).replace(",", ".").strip()))
+    except (TypeError, ValueError):
+        out = int(default)
+    if minimum is not None:
+        out = max(out, int(minimum))
+    if maximum is not None:
+        out = min(out, int(maximum))
+    return out
+
+def to_float(value, default=0.0, minimum=None, maximum=None):
+    try:
+        out = float(str(value).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        out = float(default)
+    if minimum is not None:
+        out = max(out, float(minimum))
+    if maximum is not None:
+        out = min(out, float(maximum))
+    return out
+
 def log_audit(conn, company_id, user_id, action, detail=""):
     conn.execute("INSERT INTO audit_logs(company_id,user_id,action,detail,created_at) VALUES(?,?,?,?,?)", (company_id, user_id, action, detail, now()))
 
@@ -135,6 +182,145 @@ def brl(v):
         return "R$ " + f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "R$ 0,00"
+
+# ---------------------------------------------------------------- Loja pública (URL amigável + preview social)
+def esc_html(value):
+    return html_lib.escape(str(value if value is not None else ""), quote=True)
+
+def store_page_html(company, settings, products, base, focus=None, reviews=None):
+    """Página pública servida em /loja/<slug> (e /loja/<slug>/produto/<id>).
+
+    Renderizada no servidor para o link funcionar em preview de WhatsApp/Facebook/Google
+    e também abrir rápido no celular; o botão leva para a loja completa (carrinho/checkout).
+    """
+    settings = settings or {}
+    slug = company["slug"]
+    store_name = (settings.get("store_name") or company["name"] or "Minha Loja").strip()
+    color = settings.get("primary_color") or "#7c3aed"
+    logo = settings.get("logo") or "🛍️"
+    description = (settings.get("description") or "").strip()
+    banner = (settings.get("banner") or description or f"Confira os produtos de {store_name} e faça seu pedido online.").strip()
+    backorder = to_int(settings.get("allow_backorder"), 0) > 0
+    wa = re.sub(r"\D", "", str(company["whatsapp"] or ""))
+    if wa and not wa.startswith("55"):
+        wa = "55" + wa
+    store_url = f"{base}/loja/{slug}"
+    app_url = f"{base}/#/loja/{slug}"
+    # Título enxuto para preview: só acrescenta o banner quando o nome é curto e não repete o texto
+    title = f"{store_name} · {banner[:70]}" if (banner and len(store_name) <= 30 and banner.lower() not in store_name.lower()) else store_name
+    page_desc = description or banner
+    if focus:
+        title = f"{focus['name']} · {brl(focus['price'])} — {store_name}"
+        page_desc = (focus.get("description") or banner)[:180]
+    og_image = ""
+    for candidate in ([focus] if focus else []) + list(products):
+        if candidate and candidate.get("image"):
+            img = str(candidate["image"])
+            og_image = img if img.startswith("http") else base + img
+            break
+    cards = []
+    for p in products[:24]:
+        img = str(p.get("image") or "")
+        thumb = (f'<img src="{esc_html(img)}" alt="{esc_html(p["name"])}" loading="lazy">' if img
+                 else f'<span class="ph">{esc_html(p.get("icon") or "🎁")}</span>')
+        stock = to_int(p.get("stock"), 0)
+        tag = (f'<span class="tag">{stock} disponíveis</span>' if stock > 0 else
+               ('<span class="tag encomenda">Sob encomenda</span>' if backorder else '<span class="tag esgotado">Esgotado</span>'))
+        cards.append(
+            f'<a class="p" href="{esc_html(base)}/loja/{esc_html(slug)}/produto/{to_int(p["id"])}">{thumb}'
+            f'<div class="pb"><b>{esc_html(p["name"])}</b><p>{esc_html((p.get("description") or "")[:90])}</p>'
+            f'<div class="pr"><span class="price">{esc_html(brl(p.get("price")))}</span>{tag}</div></div></a>')
+    if focus:
+        hero_product = f'<div class="focus"><b>Você recebeu este produto:</b> <span>{esc_html(focus["name"])} — {esc_html(brl(focus["price"]))}</span></div>'
+    else:
+        hero_product = ""
+    reviews_html = ""
+    if reviews:
+        items = "".join(f'<div class="rev"><b>{"⭐" * to_int(r.get("rating"), 5, minimum=1, maximum=5)}</b>'
+                        f'<p>{esc_html((r.get("comment") or "")[:160])}</p><span>— {esc_html(r.get("customer_name") or "Cliente")}</span></div>'
+                        for r in reviews[:3])
+        reviews_html = f'<h2>Avaliações de quem já comprou</h2><div class="revs">{items}</div>'
+    whatsapp_btn = (f'<a class="btn ghost" href="https://wa.me/{esc_html(wa)}?text={urllib.parse.quote("Olá! Vi sua loja e quero comprar: " + store_url)}" rel="noopener" target="_blank">💬 Falar no WhatsApp</a>'
+                    if wa else "")
+    json_ld = json.dumps({
+        "@context": "https://schema.org", "@type": "Store", "name": store_name, "description": page_desc,
+        "url": store_url, **({"image": og_image} if og_image else {}),
+        "address": {"@type": "PostalAddress", "addressLocality": company["city"] or "", "addressRegion": company["region"] or "", "addressCountry": "BR"},
+        "makesOffer": [{"@type": "Offer", "priceCurrency": "BRL", "price": round(to_float(p.get("price")), 2),
+                        "availability": ("https://schema.org/InStock" if to_int(p.get("stock"), 0) > 0 else
+                                         ("https://schema.org/PreOrder" if backorder else "https://schema.org/OutOfStock")),
+                        "itemOffered": {"@type": "Product", "name": p["name"], "description": (p.get("description") or "")[:180]}}
+                       for p in (products[:12])],
+    }, ensure_ascii=False)
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{esc_html(title)}</title>
+<meta name="description" content="{esc_html(page_desc)}">
+<link rel="canonical" href="{esc_html(store_url)}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{esc_html(store_name)}">
+<meta property="og:title" content="{esc_html(title)}">
+<meta property="og:description" content="{esc_html(page_desc)}">
+<meta property="og:url" content="{esc_html(store_url)}">
+{f'<meta property="og:image" content="{esc_html(og_image)}">' if og_image else ""}
+<meta name="twitter:card" content="{'summary_large_image' if og_image else 'summary'}">
+<meta name="theme-color" content="{esc_html(color)}">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>{esc_html(logo[:2])}</text></svg>">
+<script type="application/ld+json">{json_ld}</script>
+<style>
+:root{{--c:{esc_html(color)}}}
+*{{box-sizing:border-box}}
+body{{margin:0;font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#0f172a}}
+.wrap{{max-width:1020px;margin:0 auto;padding:0 16px 56px}}
+.top{{background:linear-gradient(135deg,var(--c),#111827);color:#fff;padding:34px 16px 30px;text-align:center}}
+.top .logo{{font-size:46px}}
+.top h1{{margin:8px 0 6px;font-size:27px}}
+.top p{{margin:0 auto;max-width:640px;opacity:.92;line-height:1.55}}
+.cta{{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:20px}}
+.btn{{display:inline-block;background:var(--c);color:#fff;text-decoration:none;font-weight:700;padding:13px 22px;border-radius:12px}}
+.btn.ghost{{background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.35)}}
+h2{{color:#fff;font-size:19px;margin:30px 0 14px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:14px}}
+.p{{background:#fff;border-radius:16px;overflow:hidden;text-decoration:none;color:inherit;display:flex;flex-direction:column}}
+.p img,.p .ph{{width:100%;height:155px;object-fit:cover;display:flex;align-items:center;justify-content:center;font-size:54px;background:linear-gradient(135deg,#ede9fe,#fce7f3)}}
+.pb{{padding:13px 14px 15px;display:flex;flex-direction:column;gap:6px;flex:1}}
+.pb p{{margin:0;font-size:12.5px;color:#64748b;line-height:1.45;flex:1}}
+.pr{{display:flex;align-items:center;justify-content:space-between;gap:8px}}
+.price{{font-weight:800;font-size:17px}}
+.tag{{font-size:11px;background:#eef2ff;color:#4338ca;border-radius:999px;padding:4px 9px;white-space:nowrap}}
+.tag.encomenda{{background:#fef3c7;color:#92400e}}
+.tag.esgotado{{background:#fee2e2;color:#991b1b}}
+.focus{{background:#fff;border-radius:14px;padding:14px 16px;margin:22px 0 0;text-align:center}}
+.revs{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}}
+.rev{{background:#fff;border-radius:14px;padding:14px}}
+.rev p{{margin:6px 0;font-size:13px;color:#334155}}
+.rev span{{font-size:12px;color:#64748b}}
+footer{{color:#94a3b8;font-size:12.5px;text-align:center;margin-top:38px;line-height:1.7}}
+footer a{{color:#c4b5fd}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="logo">{esc_html(logo)}</div>
+  <h1>{esc_html(store_name)}</h1>
+  <p>{esc_html(banner)}</p>
+  <div class="cta"><a class="btn" href="{esc_html(app_url)}">🛒 Ver loja completa e comprar</a>{whatsapp_btn}</div>
+</header>
+<div class="wrap">
+  {hero_product}
+  <h2>{'Produtos' if products else 'Catálogo em preparação'}</h2>
+  <div class="grid">{"".join(cards) or '<p style="color:#cbd5e1">Os produtos desta loja estão sendo cadastrados. Fale com a loja para saber mais.</p>'}</div>
+  {reviews_html}
+  <footer>
+    {esc_html(company["city"] or "")}{' · ' + esc_html(company["region"]) if company["region"] else ''}<br>
+    Loja criada com <a href="{esc_html(base)}">ProdutoVenda IA</a> 🚀 — Você cadastra o que vende. A IA transforma em vendas.
+  </footer>
+</div>
+</body>
+</html>"""
 
 def ai_product_page(product, company):
     emoji, purpose, diff = segment_hook(product["name"], company["segment"] if company else "")
@@ -388,29 +574,103 @@ def init_db():
     prcols = [r[1] for r in conn.execute("PRAGMA table_info(products)")]
     if "image" not in prcols:
         conn.execute("ALTER TABLE products ADD COLUMN image TEXT DEFAULT ''")
+    stcols = [r[1] for r in conn.execute("PRAGMA table_info(store_settings)")]
+    if "allow_backorder" not in stcols:  # vender itens "sob encomenda" mesmo com estoque zerado
+        conn.execute("ALTER TABLE store_settings ADD COLUMN allow_backorder INTEGER DEFAULT 0")
+    for target in INDEXES:  # depois das migrações, para os índices apontarem para colunas existentes
+        name = "idx_" + re.sub(r"[^a-z0-9]+", "_", target.lower()).strip("_")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {target}")
+    purge_expired(conn)
     conn.commit()
     seed(conn)
     conn.close()
 
+def purge_expired(conn):
+    """Remove sessões/tokens vencidos (higiene do banco em execuções longas)."""
+    try:
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
+        conn.execute("DELETE FROM password_resets WHERE expires_at <= ? OR used=1", (now(),))
+        conn.commit()
+    except sqlite3.DatabaseError:
+        pass
+
 # ---------------------------------------------------------------- HTTP helpers
 LOGIN_ATTEMPTS = {}
+RATE_BUCKETS = {}
+RATE_LOCK = threading.Lock()
+
+def rate_limit_bucket(key, limit, window_seconds):
+    """Janela deslizante em memória. Retorna True se a requisição é permitida."""
+    now_ts = time.monotonic()
+    with RATE_LOCK:
+        hits = [t for t in RATE_BUCKETS.get(key, []) if now_ts - t < window_seconds]
+        allowed = len(hits) < limit
+        if allowed:
+            hits.append(now_ts)
+        RATE_BUCKETS[key] = hits
+        if len(RATE_BUCKETS) > 5000:  # poda simples de memória
+            for k in [k for k, v in RATE_BUCKETS.items() if not v][:2000]:
+                RATE_BUCKETS.pop(k, None)
+    return allowed
+
 def rate_limited(key):
     now_ts = datetime.datetime.now().timestamp()
     attempts = [t for t in LOGIN_ATTEMPTS.get(key, []) if now_ts - t < 900]
     LOGIN_ATTEMPTS[key] = attempts
+    if len(LOGIN_ATTEMPTS) > 5000:
+        LOGIN_ATTEMPTS.clear()
     return len(attempts) >= 10
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"          # keep-alive (o Content-Length é sempre enviado)
+    server_version = "ProdutoVendaIA/" + APP_VERSION
+    timeout = 60                            # conexões ociosas são liberadas (sem thread presa no keep-alive)
+    _request_count = 0
+    _buffer = None                          # resposta pendente da API (ver _defer_response)
+    _status = None
+
     def log_message(self, *args):
         pass
+
+    def log_error(self, *args):
+        pass
+
+    def _is_https(self):
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        if proto:
+            return proto == "https"
+        return bool(PUBLIC_URL.startswith("https://"))
 
     def _security_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; "
+                         "script-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'")
+        if self._is_https():
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+    # Dentro de uma requisição de API a resposta é montada em memória e só é enviada
+    # depois do commit (ou rollback) da transação. Sem isso, o cliente podia ler a
+    # resposta e disparar a próxima chamada antes dos dados estarem gravados.
+    def _defer_response(self, writer, *args, **kwargs):
+        if self._buffer is None:      # fora da API (arquivos estáticos): escreve direto
+            return False
+        if self._buffer:
+            print("[aviso] mais de uma resposta para a mesma requisição — mantida a primeira", file=sys.stderr, flush=True)
+            return True
+        self._buffer.append((writer, args, kwargs))
+        return True
 
     def send_json(self, data, status=200):
+        self._status = status
+        if self._defer_response(self._write_json, data, status):
+            return
+        self._write_json(data, status)
+
+    def _write_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -420,6 +680,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_download(self, filename, content, content_type="text/csv; charset=utf-8"):
+        self._status = 200
+        if self._defer_response(self._write_download, filename, content, content_type):
+            return
+        self._write_download(filename, content, content_type)
+
+    def _write_download(self, filename, content, content_type="text/csv; charset=utf-8"):
         body = content.encode("utf-8") if isinstance(content, str) else content
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -430,6 +696,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_text(self, text, status=200):
+        self._status = status
+        if self._defer_response(self._write_text, text, status):
+            return
+        self._write_text(text, status)
+
+    def _write_text(self, text, status=200):
         body = str(text).encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -439,12 +711,46 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def base_url(self):
-        host = self.headers.get("Host") or "localhost:8000"
-        proto = self.headers.get("X-Forwarded-Proto") or ("https" if host.endswith(".e2b.app") or ".app" in host else "http")
+        """URL pública do sistema. PV_PUBLIC_URL tem prioridade — o header Host nunca é usado
+        para montar links (evita host header injection em e-mails e back_urls de pagamento)."""
+        if PUBLIC_URL:
+            return PUBLIC_URL
+        host = (self.headers.get("Host") or "localhost:8000").strip()
+        if not re.match(r"^[A-Za-z0-9.\-]+(:\d{1,5})?$", host):
+            host = "localhost:8000"
+        proto = (self.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip().lower()
+        if proto not in ("http", "https"):
+            proto = "http"
         return f"{proto}://{host}"
 
+    def client_ip(self):
+        fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        return fwd or (self.client_address[0] if self.client_address else "desconhecido")
+
+    def allowed(self, scope, limit, window_seconds=900, ident=None):
+        """Rate limit por IP (+ identificador opcional). Responde 429 e devolve False quando estoura."""
+        key = f"{scope}:{ident or self.client_ip()}"
+        if not rate_limit_bucket(key, limit, window_seconds):
+            self.send_json({"error": "Muitas requisições em sequência. Aguarde alguns instantes e tente novamente."}, 429)
+            return False
+        return True
+
+    def body_too_large(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > MAX_BODY_BYTES:
+            self.close_connection = True  # não lemos o corpo: encerra a conexão para não corromper o keep-alive
+            self.send_json({"error": f"Conteúdo muito grande (limite de {MAX_BODY_BYTES // (1024 * 1024)} MB)."}, 413)
+            return True
+        return False
+
     def body_json(self):
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
         if not length:
             return {}
         try:
@@ -479,25 +785,109 @@ class Handler(BaseHTTPRequestHandler):
             return self.api("GET", path, query, {})
         return self.serve_static(path)
 
+    def do_HEAD(self):
+        """Monitoramento/uptime costuma usar HEAD — responde cabeçalhos sem corpo."""
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/"):
+            self.send_response(405)
+            self.send_header("Allow", "GET, POST, PUT, DELETE")
+            self.send_header("Content-Length", "0")
+            self._security_headers()
+            self.end_headers()
+            return
+        path = parsed.path
+        file_path = os.path.join(STATIC, "index.html") if path in ("", "/") else os.path.normpath(os.path.join(STATIC, path.lstrip("/")))
+        if not file_path.startswith(STATIC) or not os.path.isfile(file_path):
+            file_path = os.path.join(STATIC, "index.html")
+        ext = os.path.splitext(file_path)[1]
+        ctype = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}.get(ext, "text/plain")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(os.path.getsize(file_path)))
+        self._security_headers()
+        self.end_headers()
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path.startswith("/api/"):
+            if self.body_too_large():
+                return
             return self.api("POST", parsed.path, {}, self.body_json())
+        self.close_connection = True
         self.send_json({"error": "not found"}, 404)
 
     def do_PUT(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path.startswith("/api/"):
+            if self.body_too_large():
+                return
             return self.api("PUT", parsed.path, {}, self.body_json())
+        self.close_connection = True
         self.send_json({"error": "not found"}, 404)
 
     def do_DELETE(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path.startswith("/api/"):
             return self.api("DELETE", parsed.path, {}, {})
+        self.close_connection = True
         self.send_json({"error": "not found"}, 404)
 
+    def send_html(self, content, status=200, cache="public, max-age=120"):
+        return self.send_response_body(content, "text/html; charset=utf-8", status, cache)
+
+    def send_response_body(self, content, content_type, status=200, cache="public, max-age=120"):
+        body = content.encode("utf-8") if isinstance(content, str) else content
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache)
+        self._security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _public_stores(self):
+        conn = db()
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT c.slug FROM companies c WHERE EXISTS (SELECT 1 FROM products p WHERE p.company_id=c.id AND p.status='ativo') ORDER BY c.id LIMIT 2000")]
+        finally:
+            conn.close()
+
+    def serve_public_store(self, slug, product_id=None):
+        conn = db()
+        try:
+            company = conn.execute("SELECT * FROM companies WHERE slug=?", (slug,)).fetchone()
+            if not company:
+                return self.send_html(
+                    '<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>Loja não encontrada</title></head>'
+                    '<body style="font-family:system-ui;text-align:center;padding:80px 20px;background:#0f172a;color:#e2e8f0">'
+                    '<h1>🔍 Loja não encontrada</h1><p>Este link pode ter sido alterado ou a loja foi desativada.</p>'
+                    f'<p><a style="color:#c4b5fd" href="{esc_html(self.base_url())}">Ir para a página inicial</a></p></body></html>', 404, "no-cache")
+            settings_row = conn.execute("SELECT * FROM store_settings WHERE company_id=?", (company["id"],)).fetchone()
+            settings = dict(settings_row) if settings_row else {}
+            products = [dict(r) for r in conn.execute("SELECT * FROM products WHERE company_id=? AND status='ativo' ORDER BY sales DESC, id DESC", (company["id"],))]
+            reviews = [dict(r) for r in conn.execute("SELECT * FROM reviews WHERE company_id=? ORDER BY id DESC LIMIT 3", (company["id"],))]
+            focus = next((p for p in products if product_id and p["id"] == product_id), None)
+            if product_id and not focus:
+                focus = None
+            page = store_page_html(company, settings, products, self.base_url(), focus=focus, reviews=reviews)
+            return self.send_html(page)
+        finally:
+            conn.close()
+
     def serve_static(self, path):
+        if path == "/robots.txt":
+            base = self.base_url()
+            return self.send_text(f"User-agent: *\nAllow: /loja/\nDisallow: /api/\nDisallow: /uploads/\nSitemap: {base}/sitemap.xml\n")
+        if path == "/sitemap.xml":
+            base = self.base_url()
+            urls = [f"<url><loc>{esc_html(base)}/loja/{esc_html(r['slug'])}</loc></url>"
+                    for r in self._public_stores()]
+            body = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + "".join(urls) + "</urlset>"
+            return self.send_response_body(body, "application/xml; charset=utf-8")
+        m = re.match(r"^/loja/([\w-]{1,80})(?:/produto/(\d+))?/?$", path)
+        if m:
+            return self.serve_public_store(m.group(1), to_int(m.group(2), 0) or None)
         if path.startswith("/uploads/"):
             file_path = os.path.normpath(os.path.join(UPLOAD_DIR, path[len("/uploads/"):]))
             if not file_path.startswith(os.path.normpath(UPLOAD_DIR)) or not os.path.isfile(file_path):
@@ -533,16 +923,44 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- API
     def api(self, method, path, query, data):
+        Handler._request_count += 1
+        if Handler._request_count % 500 == 0:          # higiene periódica em execuções longas
+            conn0 = db()
+            try:
+                purge_expired(conn0)
+            finally:
+                conn0.close()
         conn = db()
+        self._status = None
+        self._buffer = []
         try:
-            result = self.route(conn, method, path, query, data)
-            conn.commit()
-            return result
+            self.route(conn, method, path, query, data)
+            status = self._status or 200
+            # Só confirma a transação quando a resposta foi de sucesso: um erro no meio
+            # do fluxo não deixa escritas parciais para trás.
+            if status >= 400:
+                conn.rollback()
+            else:
+                conn.commit()
+        except sqlite3.DatabaseError as e:
+            conn.rollback()
+            self._buffer = None
+            print(f"[db] {method} {path}: {e}", file=sys.stderr, flush=True)
+            return self.send_json({"error": "Banco de dados ocupado ou indisponível no momento. Tente novamente em instantes."}, 503)
         except Exception as e:
             conn.rollback()
-            return self.send_json({"error": f"Erro interno: {e}"}, 500)
+            self._buffer = None
+            print(f"[erro] {method} {path}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            return self.send_json({"error": "Erro interno no servidor. Tente novamente; se persistir, avise o suporte."}, 500)
         finally:
             conn.close()
+            # Transação encerrada: agora sim a resposta pode ir para o cliente.
+            pending, self._buffer = self._buffer or [], None
+            for writer, args, kwargs in pending:
+                try:
+                    writer(*args, **kwargs)
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    print(f"[aviso] cliente desconectou antes da resposta ({method} {path}): {e}", file=sys.stderr, flush=True)
 
     def route(self, conn, method, path, query, data):
         # Public store
@@ -560,12 +978,16 @@ class Handler(BaseHTTPRequestHandler):
                                    "payments": {"mercadopago": mp_on, "pix": mp_on, "card": mp_on}})
         m = re.match(r"^/api/public/store/([\w-]+)/checkout$", path)
         if m and method == "POST":
+            if not self.allowed("checkout", 100, 600):
+                return
             company = conn.execute("SELECT * FROM companies WHERE slug=?", (m.group(1),)).fetchone()
             if not company:
                 return self.send_json({"error": "Loja não encontrada"}, 404)
             return self.public_checkout(conn, company, data)
         m = re.match(r"^/api/public/store/([\w-]+)/cart$", path)
         if m and method == "POST":
+            if not self.allowed("carrinho", 120, 600):
+                return
             company = conn.execute("SELECT * FROM companies WHERE slug=?", (m.group(1),)).fetchone()
             if not company:
                 return self.send_json({"error": "Loja não encontrada"}, 404)
@@ -587,6 +1009,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True, "cart_id": cur.lastrowid, "total": round(total, 2), "message": "Carrinho salvo! 💾 Se você não concluir, a loja poderá te lembrar pelo WhatsApp (somente sobre este pedido)."}, 201)
         m = re.match(r"^/api/public/store/([\w-]+)/review$", path)
         if m and method == "POST":
+            if not self.allowed("avaliacao", 40, 600):
+                return
             company = conn.execute("SELECT * FROM companies WHERE slug=?", (m.group(1),)).fetchone()
             if not company:
                 return self.send_json({"error": "Loja não encontrada"}, 404)
@@ -632,17 +1056,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health" and method == "GET":
             try:
                 conn.execute("SELECT 1")
+                conn.execute("SELECT COUNT(*) FROM companies")
                 db_ok = True
             except Exception:
                 db_ok = False
-            return self.send_json({"status": "ok" if db_ok else "degraded", "app": "ProdutoVenda IA", "version": APP_VERSION, "db": "ok" if db_ok else "erro", "time": now()})
+            return self.send_json({"status": "ok" if db_ok else "degraded", "app": "ProdutoVenda IA", "version": APP_VERSION,
+                                   "db": "ok" if db_ok else "erro", "time": now(),
+                                   "uptime_seconds": int(time.time() - STARTED_AT), "public_url": PUBLIC_URL or self.base_url()})
 
         # Auth
         if path == "/api/auth/register" and method == "POST":
+            if not self.allowed("register", 10, 3600):
+                return
             return self.register(conn, data)
         if path == "/api/auth/login" and method == "POST":
+            if not self.allowed("login-ip", 60, 900):
+                return
             return self.login(conn, data)
         if path == "/api/auth/forgot" and method == "POST":
+            if not self.allowed("forgot", 15, 900):
+                return
             email = (data.get("email") or "").strip().lower()
             user_row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
             generic = {"ok": True, "message": "Se existir uma conta com este e-mail, enviamos um link de redefinição (válido por 1 hora). Verifique também a caixa de spam."}
@@ -667,6 +1100,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({**generic, "reset_link": link, "message": generic["message"] + " (Modo local: link exibido porque o SMTP não está configurado.)"})
             return self.send_json({**generic, "message": generic["message"] + " Dica: configure o SMTP em Integrações para o envio automático do link."})
         if path == "/api/auth/reset" and method == "POST":
+            if not self.allowed("reset", 20, 900):
+                return
             token = data.get("token") or ""
             password = data.get("password") or ""
             if len(password) < 6:
@@ -1027,10 +1462,25 @@ class Handler(BaseHTTPRequestHandler):
             settings = conn.execute("SELECT * FROM store_settings WHERE company_id=?", (cid,)).fetchone()
             return self.send_json({"company": dict(company), "store": dict(settings) if settings else {}})
         if path == "/api/settings" and method == "PUT":
+            # Campos ausentes preservam o valor atual (evita apagar dados em atualizações parciais)
+            autopilot = data.get("autopilot") or company["autopilot"] or "assistido"
+            if autopilot not in ("manual", "assistido", "automatico"):
+                autopilot = "assistido"
             conn.execute("UPDATE companies SET name=?, segment=?, city=?, region=?, whatsapp=?, email=?, goal_monthly=?, goal_weekly=?, goal_daily=?, autopilot=? WHERE id=?",
-                         (data.get("name", company["name"]), data.get("segment", company["segment"]), data.get("city", ""), data.get("region", ""), data.get("whatsapp", ""), data.get("email", ""), float(data.get("goal_monthly") or 6000), float(data.get("goal_weekly") or 1500), float(data.get("goal_daily") or 200), data.get("autopilot", "assistido"), cid))
-            conn.execute("INSERT INTO store_settings(company_id,store_name,logo,primary_color,banner,font,instagram,facebook,description) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET store_name=excluded.store_name, logo=excluded.logo, primary_color=excluded.primary_color, banner=excluded.banner, font=excluded.font, instagram=excluded.instagram, facebook=excluded.facebook, description=excluded.description",
-                         (cid, data.get("store_name", "Minha Loja"), data.get("logo", "🛍️"), data.get("primary_color", "#7c3aed"), data.get("banner", ""), data.get("font", "Inter"), data.get("instagram", ""), data.get("facebook", ""), data.get("store_description", data.get("description", ""))))
+                         (str(data.get("name") or company["name"])[:120], data.get("segment") or company["segment"], data.get("city", company["city"] or ""),
+                          data.get("region", company["region"] or ""), data.get("whatsapp", company["whatsapp"] or ""), data.get("email", company["email"] or ""),
+                          round(to_float(data.get("goal_monthly"), company["goal_monthly"] or 6000, minimum=0), 2),
+                          round(to_float(data.get("goal_weekly"), company["goal_weekly"] or 1500, minimum=0), 2),
+                          round(to_float(data.get("goal_daily"), company["goal_daily"] or 200, minimum=0), 2), autopilot, cid))
+            if data.get("allow_backorder") is None:  # campo ausente (ex.: salvar só a personalização) mantém o valor atual
+                current = conn.execute("SELECT allow_backorder FROM store_settings WHERE company_id=?", (cid,)).fetchone()
+                backorder = to_int(current["allow_backorder"], 0) if current else 0
+            else:
+                backorder = to_int(data.get("allow_backorder"), 0, minimum=0, maximum=1)
+            conn.execute("INSERT INTO store_settings(company_id,store_name,logo,primary_color,banner,font,instagram,facebook,description,allow_backorder) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET store_name=excluded.store_name, logo=excluded.logo, primary_color=excluded.primary_color, banner=excluded.banner, font=excluded.font, instagram=excluded.instagram, facebook=excluded.facebook, description=excluded.description, allow_backorder=excluded.allow_backorder",
+                         (cid, str(data.get("store_name") or "Minha Loja")[:120], str(data.get("logo") or "🛍️")[:4], str(data.get("primary_color") or "#7c3aed")[:20],
+                          str(data.get("banner") or "")[:200], str(data.get("font") or "Inter")[:40], str(data.get("instagram") or "")[:120], str(data.get("facebook") or "")[:120],
+                          str(data.get("store_description", data.get("description", "")))[:600], backorder))
             log_audit(conn, cid, user["id"], "settings_update", "Configurações atualizadas")
             return self.send_json({"ok": True})
 
@@ -1135,6 +1585,64 @@ class Handler(BaseHTTPRequestHandler):
         "reviews": ["product_id", "customer_name", "rating", "comment"],
     }
     TABLE_MAP = {"content": "campaign_contents", "email-campaigns": "email_campaigns", "templates": "message_templates"}
+    COUPON_TYPES = ("percentual", "fixo")
+
+    def prepare(self, conn, cid, resource, data, rid=None):
+        """Normaliza e valida os campos antes de gravar (tenant-safe). Retorna a mensagem de erro ou None."""
+        if resource == "coupons":
+            if "code" in data:
+                code = re.sub(r"\s+", "", str(data.get("code") or "")).upper()
+                if not re.match(r"^[A-Z0-9\-_]{3,24}$", code):
+                    return "Código do cupom inválido: use de 3 a 24 caracteres (letras, números, - ou _)."
+                if conn.execute("SELECT id FROM coupons WHERE company_id=? AND UPPER(code)=? AND id<>?", (cid, code, to_int(rid, 0))).fetchone():
+                    return f"Já existe um cupom com o código {code}. Use outro código."
+                data["code"] = code
+            type_ = data.get("type") or "percentual"
+            if type_ not in self.COUPON_TYPES:
+                return "Tipo de cupom inválido: use percentual ou valor fixo."
+            if "value" in data:
+                value = to_float(data.get("value"))
+                if value <= 0:
+                    return "Informe um valor de desconto maior que zero."
+                if type_ == "percentual" and value > 100:
+                    return "O desconto percentual não pode passar de 100%."
+                data["value"] = round(value, 2)
+            if "min_value" in data:
+                data["min_value"] = round(to_float(data.get("min_value"), 0, minimum=0), 2)
+            if "limit_uses" in data:
+                data["limit_uses"] = to_int(data.get("limit_uses"), 0, minimum=0)
+            if "active" in data:
+                data["active"] = to_int(data.get("active"), 1, minimum=0, maximum=1)
+            if "product_id" in data:
+                data["product_id"] = to_int(data.get("product_id"), 0, minimum=0) or None
+        elif resource == "products":
+            if "name" in data:
+                name = str(data.get("name") or "").strip()
+                if not name:
+                    return "Informe o nome do produto."
+                data["name"] = name[:120]
+            for field in ("price", "cost"):
+                if field in data:
+                    data[field] = round(to_float(data.get(field), 0, minimum=0), 2)
+            if "stock" in data:
+                data["stock"] = to_int(data.get("stock"), 0, minimum=0)
+            if "status" in data and data["status"] not in ("ativo", "inativo", "pausado"):
+                data["status"] = "ativo"
+        elif resource == "orders":
+            for field in ("total", "profit"):
+                if field in data:
+                    data[field] = round(to_float(data.get(field), 0, minimum=0), 2)
+        elif resource == "customers":
+            for field, default in (("consent", 1), ("vip", 0)):
+                if field in data:
+                    data[field] = to_int(data.get(field), default, minimum=0, maximum=1)
+        elif resource == "reviews":
+            if "rating" in data:
+                data["rating"] = to_int(data.get("rating"), 5, minimum=1, maximum=5)
+        elif resource == "leads":
+            if "value" in data:
+                data["value"] = round(to_float(data.get("value"), 0, minimum=0), 2)
+        return None
 
     def crud(self, conn, method, path, data, cid, user):
         m = re.match(r"^/api/([a-z\-]+)(?:/(\d+))?$", path)
@@ -1157,7 +1665,14 @@ class Handler(BaseHTTPRequestHandler):
             row = conn.execute(f"SELECT * FROM {table} WHERE id=? AND company_id=?", (rid, cid)).fetchone()
             return self.send_json({"item": dict(row) if row else None}) or True
         if method == "POST" and not rid:
+            err = self.prepare(conn, cid, resource, data)
+            if err:
+                self.send_json({"error": err}, 400)
+                return True
             cols = [f for f in fields if f in data]
+            if not cols:
+                self.send_json({"error": "Informe ao menos um campo válido para criar o registro."}, 400)
+                return True
             values = [data[f] for f in cols]
             cur = conn.execute(f"INSERT INTO {table}(company_id,{','.join(cols)},created_at) VALUES(?,{','.join('?'*len(cols))},?)", [cid] + values + [now()])
             if resource == "products":
@@ -1172,6 +1687,10 @@ class Handler(BaseHTTPRequestHandler):
             exists = conn.execute(f"SELECT id FROM {table} WHERE id=? AND company_id=?", (rid, cid)).fetchone()
             if not exists:
                 self.send_json({"error": "Registro não encontrado neste tenant"}, 404)
+                return True
+            err = self.prepare(conn, cid, resource, data, rid)
+            if err:
+                self.send_json({"error": err}, 400)
                 return True
             cols = [f for f in fields if f in data]
             if cols:
@@ -1383,23 +1902,30 @@ class Handler(BaseHTTPRequestHandler):
         items = data.get("items") or []
         if not items:
             return self.send_json({"error": "Carrinho vazio."}, 400)
-        name = data.get("customer_name") or "Cliente da loja"
+        payment_method = (data.get("payment_method") or "manual").strip().lower()
+        if payment_method not in ("manual", "pix", "card"):
+            return self.send_json({"error": "Forma de pagamento inválida."}, 400)
+        name = (data.get("customer_name") or "Cliente da loja").strip()[:120] or "Cliente da loja"
+        store = conn.execute("SELECT * FROM store_settings WHERE company_id=?", (cid,)).fetchone()
+        backorder = bool(store and store["allow_backorder"])
         total, profit = 0.0, 0.0
         lines = []
         for it in items:
-            product = conn.execute("SELECT * FROM products WHERE id=? AND company_id=?", (it.get("product_id"), cid)).fetchone()
+            product = conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND status='ativo'", (it.get("product_id"), cid)).fetchone()
             if not product:
                 continue
-            qty = max(int(it.get("qty") or 1), 1)
-            if (product["stock"] or 0) < qty:
-                return self.send_json({"error": f"Estoque insuficiente para {product['name']}."}, 400)
+            qty = to_int(it.get("qty"), 1, minimum=1, maximum=999)
+            if not backorder and (product["stock"] or 0) < qty:
+                return self.send_json({"error": f"Estoque insuficiente para {product['name']}. Disponível: {product['stock'] or 0} un."}, 400)
             total += float(product["price"]) * qty
             profit += (float(product["price"]) - float(product["cost"] or 0)) * qty
             lines.append((product, qty))
+        if not lines:
+            return self.send_json({"error": "Nenhum produto válido no carrinho."}, 400)
         discount = 0.0
         coupon_row = None
         if data.get("coupon"):
-            coupon_row = conn.execute("SELECT * FROM coupons WHERE company_id=? AND UPPER(code)=UPPER(?) AND active=1", (cid, data["coupon"])).fetchone()
+            coupon_row = conn.execute("SELECT * FROM coupons WHERE company_id=? AND UPPER(code)=UPPER(?) AND active=1", (cid, str(data["coupon"]).strip())).fetchone()
             if not coupon_row:
                 return self.send_json({"error": "Cupom inválido ou inativo."}, 400)
             if coupon_row["limit_uses"] and coupon_row["used"] >= coupon_row["limit_uses"]:
@@ -1407,6 +1933,7 @@ class Handler(BaseHTTPRequestHandler):
             if total < float(coupon_row["min_value"] or 0):
                 return self.send_json({"error": f"Este cupom exige compra mínima de {brl(coupon_row['min_value'])}."}, 400)
             discount = total * float(coupon_row["value"]) / 100 if coupon_row["type"] == "percentual" else float(coupon_row["value"])
+            discount = max(0.0, min(discount, total))   # cupom nunca gera total negativo nem desconto fantasma
         total = round(total - discount, 2)
         customer = conn.execute("SELECT * FROM customers WHERE company_id=? AND (phone=? OR email=?)", (cid, data.get("phone", ""), data.get("email", ""))).fetchone() if (data.get("phone") or data.get("email")) else None
         if not customer:
@@ -1415,16 +1942,29 @@ class Handler(BaseHTTPRequestHandler):
             customer = conn.execute("SELECT * FROM customers WHERE id=?", (cur.lastrowid,)).fetchone()
             conn.execute("INSERT INTO messages(company_id,customer_id,channel,content,status,created_at) VALUES(?,?,?,?,?,?)",
                          (cid, customer["id"], "WhatsApp", f"Oi, {name.split()[0]}! 😊 Bem-vindo(a)! Use BEMVINDO10 na próxima compra.", "registrado (boas-vindas automática)", now()))
-        payment_method = (data.get("payment_method") or "manual").lower()
+        # Pagamento online só é aceito com gateway realmente conectado: sem isso o pedido
+        # ficaria marcado como pago sem nenhum dinheiro ter entrado.
         mp_cfg = integ.get_config(conn, cid, "mercadopago", active_only=True)
-        use_gateway = payment_method in ("pix", "card") and integ.configured_status("mercadopago", mp_cfg)[0]
+        mp_on = integ.configured_status("mercadopago", mp_cfg)[0]
+        if payment_method in ("pix", "card") and not mp_on:
+            return self.send_json({"error": "Esta loja ainda não está com pagamento online ativo. Escolha “combinar pagamento com a loja” para finalizar seu pedido."}, 400)
+        use_gateway = payment_method in ("pix", "card")
         order_status = "aguardando pagamento" if use_gateway else "pago"
         cur = conn.execute("INSERT INTO orders(company_id,customer_id,customer_name,total,profit,status,channel,coupon,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                            (cid, customer["id"], name, total, round(profit, 2), order_status, "Loja", (coupon_row["code"] if coupon_row else ""), now()))
         order_id = cur.lastrowid
         for product, qty in lines:
+            if backorder:
+                # sob encomenda: vende mesmo sem estoque; o estoque nunca fica negativo
+                conn.execute("UPDATE products SET stock=MAX(COALESCE(stock,0)-?,0), sales=COALESCE(sales,0)+? WHERE id=? AND company_id=?",
+                             (qty, qty, product["id"], cid))
+            else:
+                # baixa condicional: dois pedidos simultâneos nunca deixam estoque negativo
+                updated = conn.execute("UPDATE products SET stock=stock-?, sales=COALESCE(sales,0)+? WHERE id=? AND company_id=? AND stock>=?",
+                                       (qty, qty, product["id"], cid, qty))
+                if updated.rowcount != 1:
+                    return self.send_json({"error": f"O estoque de {product['name']} mudou agora e não é mais suficiente. Ajuste a quantidade e tente de novo — nada foi cobrado."}, 409)
             conn.execute("INSERT INTO order_items(company_id,order_id,product_id,product_name,qty,price) VALUES(?,?,?,?,?,?)", (cid, order_id, product["id"], product["name"], qty, product["price"]))
-            conn.execute("UPDATE products SET stock=stock-?, sales=COALESCE(sales,0)+? WHERE id=?", (qty, qty, product["id"]))
         if coupon_row:
             conn.execute("UPDATE coupons SET used=used+1 WHERE id=?", (coupon_row["id"],))
             conn.execute("INSERT INTO coupon_usages(company_id,coupon_id,customer_id,order_id,created_at) VALUES(?,?,?,?,?)", (cid, coupon_row["id"], customer["id"], order_id, now()))
